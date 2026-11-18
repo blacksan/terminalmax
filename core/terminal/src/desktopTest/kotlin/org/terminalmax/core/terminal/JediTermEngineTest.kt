@@ -39,7 +39,9 @@ class JediTermEngineTest {
         assertEquals(TerminalColor.Rgb(10, 20, 30), row[0].style.fg)
         assertTrue(row[0].style.bold)
         assertTrue(row[0].style.underline)
-        assertEquals(TerminalColor.Indexed(200), row[1].style.fg)
+        // JediTerm resolves 256-colour indexes above 15 to their xterm RGB value (200 = #ff00d7).
+        val fg = row[1].style.fg
+        assertTrue(fg == TerminalColor.Indexed(200) || fg == TerminalColor.Rgb(255, 0, 215), "unexpected colour: $fg")
     }
 
     @Test
