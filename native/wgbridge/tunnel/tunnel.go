@@ -67,14 +67,6 @@ func (t *Tunnel) setFwdErr(err error) {
 	t.emu.Unlock()
 }
 
-// LastDeviceError returns the most recent error logged by wireguard-go
-// (ASCII-sanitised), or "".
-func (t *Tunnel) LastDeviceError() string {
-	t.emu.Lock()
-	defer t.emu.Unlock()
-	return t.lastDevErr
-}
-
 func zero(b []byte) { clear(b) }
 
 // Start brings up a tunnel from conf. Peer endpoint host names are resolved
@@ -181,15 +173,15 @@ func (t *Tunnel) OpenForward(target string) (port int, token [TokenLen]byte, err
 	return port, token, nil
 }
 
-// Stats returns the last handshake time and byte counters and the last
-// forwarder error. It streams the device's IPC output through a parser that
+// Stats returns the last handshake time and byte counters, the last
+// forwarder error and the last error logged by wireguard-go. It streams the device's IPC output through a parser that
 // never stores key lines.
 func (t *Tunnel) Stats() (Stats, error) {
 	t.mu.Lock()
 	closed := t.closed
 	t.mu.Unlock()
 	t.emu.Lock()
-	fwdErr := t.lastFwdErr
+	fwdErr, devErr := t.lastFwdErr, t.lastDevErr
 	t.emu.Unlock()
 	if closed {
 		return Stats{}, errors.New("tunnel: closed")
@@ -200,6 +192,7 @@ func (t *Tunnel) Stats() (Stats, error) {
 	}
 	st := sw.Stats()
 	st.LastForwardError = fwdErr
+	st.LastDeviceError = devErr
 	return st, nil
 }
 

@@ -21,7 +21,7 @@ extern void wgbStop(int handle);
 extern int wgbLastError(char *buf, int len);
 
 #define ERR_LEN 512
-#define STATS_LEN 512
+#define STATS_LEN 768 /* > wgconf.MaxJSONLen */
 #define TOKEN_LEN 32
 
 /* memset the compiler may not optimise away. */
@@ -52,31 +52,38 @@ JNIEXPORT jint JNICALL
 Java_org_terminalmax_core_wireguard_WgBridgeNative_nativeStart(JNIEnv *env, jobject thiz, jbyteArray conf)
 {
 	(void)thiz;
-	if (conf == NULL)
-		return -6;
-	jsize len = (*env)->GetArrayLength(env, conf);
-	if (len < 0)
-		return -6;
-	jbyte *elems = (*env)->GetByteArrayElements(env, conf, NULL);
-	if (elems == NULL)
-		return -6; /* OutOfMemoryError already pending */
-	char *buf = malloc((size_t)len + 1);
-	if (buf == NULL) {
-		wipe(elems, (size_t)len);
-		(*env)->ReleaseByteArrayElements(env, conf, elems, JNI_ABORT);
+	if (conf == NULL) {
+		throw_io(env, "wgbridge: config is null");
 		return -6;
 	}
-	memcpy(buf, elems, (size_t)len);
+	jsize len = (*env)->GetArrayLength(env, conf);
+	if (len < 0) {
+		throw_io(env, "wgbridge: invalid config length");
+		return -6;
+	}
+	/* Copy with GetByteArrayRegion (not GetByteArrayElements, whose copy the
+	 * VM may keep or not wipe); the only native copy is buf, wiped below.
+	 * The caller owns zeroing its ByteArray. */
+	char *buf = malloc((size_t)len + 1);
+	if (buf == NULL) {
+		throw_io_err(env, "", "wgbridge: out of memory");
+		return -6;
+	}
+	(*env)->GetByteArrayRegion(env, conf, 0, len, (jbyte *)buf);
+	if ((*env)->ExceptionCheck(env)) {
+		wipe(buf, (size_t)len);
+		free(buf);
+		return -6;
+	}
 	buf[len] = '\0';
 	char err[ERR_LEN];
 	err[0] = '\0';
-	/* Go copies the string (C.GoStringN) before returning. */
+	/* Go parses the text in place and retains no part of it. */
 	int ret = wgbStart(buf, err, ERR_LEN);
 	wipe(buf, (size_t)len + 1);
-	wipe(elems, (size_t)len);
-	/* JNI_ABORT: discard our (zeroed) copy, do not write back to the array. */
-	(*env)->ReleaseByteArrayElements(env, conf, elems, JNI_ABORT);
 	free(buf);
+	if (ret < 0)
+		throw_io_err(env, err, "wgbridge: start failed");
 	return ret;
 }
 

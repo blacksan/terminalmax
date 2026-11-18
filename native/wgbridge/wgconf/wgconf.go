@@ -83,12 +83,19 @@ func ResolveEndpoints(ctx context.Context, c *Config, lookup LookupFunc) error {
 		}
 		addrs, err := lookup(ctx, p.EndpointHost)
 		if err != nil {
-			// The resolver error text may repeat the host name; keep it out.
-			msg := strings.ReplaceAll(err.Error(), p.EndpointHost, "<host>")
-			if len(msg) > 128 {
-				msg = msg[:128] + "..."
+			// Never echo the resolver's text: it may repeat the host name
+			// in a transformed (for example lower-cased) form.
+			reason := "lookup failed"
+			var de *net.DNSError
+			switch {
+			case errors.As(err, &de) && de.IsNotFound:
+				reason = "no such host"
+			case errors.As(err, &de) && de.IsTimeout, errors.Is(err, context.DeadlineExceeded):
+				reason = "timeout"
+			case errors.As(err, &de) && de.IsTemporary:
+				reason = "temporary DNS failure"
 			}
-			return fmt.Errorf("wgconf: resolve endpoint of peer %d (%s): %s", i+1, safeQuote(p.EndpointHost), strconv.QuoteToASCII(msg))
+			return fmt.Errorf("wgconf: resolve endpoint of peer %d (%s): %s", i+1, safeQuote(p.EndpointHost), reason)
 		}
 		var chosen netip.Addr
 		for _, a := range addrs {
@@ -112,37 +119,27 @@ func ResolveEndpoints(ctx context.Context, c *Config, lookup LookupFunc) error {
 	return nil
 }
 
-// safeQuote quotes a user value for an error message, never echoing anything that looks like key material.
+// safeQuote quotes a user value for an error message. It is echoed only if it
+// holds fewer than 16 characters from the base64/base64url/hex alphabets in
+// total (separators are not counted, so split, wrapped, colon-hex and
+// URL-safe keys are caught).
 func safeQuote(s string) string {
-	if b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(s)); err == nil && len(b) == KeyLen {
-		return "<redacted key-like value>"
+	s = strings.TrimSpace(s)
+	n := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' ||
+			c == '+' || c == '/' || c == '-' || c == '_' {
+			n++
+		}
 	}
-	if hasKeyLikeRun(s) {
+	if n >= 16 {
 		return "<redacted key-like value>"
 	}
 	if len(s) > 64 {
 		s = s[:64] + "..."
 	}
 	return strconv.QuoteToASCII(s)
-}
-
-// hasKeyLikeRun reports whether s contains a run of 40 or more base64
-// alphabet characters (a key with a suffix, prefix, brackets, or with its
-// padding missing).
-func hasKeyLikeRun(s string) bool {
-	run := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '+' || c == '/' || c == '=' {
-			run++
-			if run >= 40 {
-				return true
-			}
-		} else {
-			run = 0
-		}
-	}
-	return false
 }
 
 // unknownKey builds the error for an unrecognised option name. Anything that
@@ -166,6 +163,7 @@ func parseKey(field, v string) (Key, error) {
 	if err != nil {
 		return k, fmt.Errorf("%s is not valid base64", field)
 	}
+	defer clear(raw)
 	if len(raw) != KeyLen {
 		return k, fmt.Errorf("%s must decode to %d bytes (got %d)", field, KeyLen, len(raw))
 	}
@@ -230,12 +228,22 @@ func parseEndpoint(v string) (host string, port uint16, lit netip.AddrPort, err 
 
 // Parse parses wg-quick style configuration text. wg-quick script hooks
 // (PreUp, PostUp, ...) are rejected rather than ignored.
-func Parse(text string) (*Config, error) {
+//
+// Parse must not retain substrings of text: the caller may pass a string that
+// aliases memory it zeroes afterwards (see cmd/libwgbridge). Every string
+// stored in the returned Config is therefore a copy (strings.Clone). On error
+// any key material already parsed is zeroed.
+func Parse(text string) (_ *Config, err error) {
 	if len(text) > maxConfigSize {
 		return nil, errors.New("wgconf: config too large")
 	}
 	text = strings.TrimPrefix(text, "\xef\xbb\xbf")
 	c := &Config{}
+	defer func() {
+		if err != nil {
+			c.Zero()
+		}
+	}()
 	section := ""
 	sawInterface := false
 	var cur *Peer
@@ -343,7 +351,7 @@ func Parse(text string) (*Config, error) {
 				if err != nil {
 					return nil, wrap(err)
 				}
-				cur.EndpointHost, cur.EndpointPort, cur.ResolvedEndpoint = h, p, lit
+				cur.EndpointHost, cur.EndpointPort, cur.ResolvedEndpoint = strings.Clone(h), p, lit
 			case "persistentkeepalive":
 				if strings.EqualFold(val, "off") {
 					cur.PersistentKeepalive = 0
@@ -395,7 +403,7 @@ func (c *Config) WriteUAPI(w *bytes.Buffer) error {
 		if p.EndpointHost != "" && !p.ResolvedEndpoint.IsValid() {
 			return fmt.Errorf("wgconf: peer %d endpoint %s is not resolved", i+1, safeQuote(p.EndpointHost))
 		}
-		size += 384 + 64*len(p.AllowedIPs)
+		size += 384 + 64*len(p.AllowedIPs) + len(p.EndpointHost) + len(p.ResolvedEndpoint.String())
 	}
 	w.Grow(size)
 

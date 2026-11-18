@@ -10,7 +10,7 @@ package main
 /*
 #include <stdlib.h>
 #include <string.h>
-static inline const char *wgb_version_str(void) { return "terminalmax-wgbridge/0.2.0"; }
+static inline const char *wgb_version_str(void) { return "terminalmax-wgbridge/0.3.0"; }
 */
 import "C"
 
@@ -111,7 +111,11 @@ func wgbStart(confText *C.char, errBuf *C.char, errLen C.int) C.int {
 	if n > C.size_t(maxConfLen) {
 		return failCall(errConfig, errBuf, errLen, "wgconf: config too large")
 	}
-	conf, err := wgconf.Parse(C.GoStringN(confText, C.int(n)))
+	// Parse over the caller's memory instead of copying it with C.GoStringN:
+	// a Go copy could never be zeroed. This is safe only because
+	// wgconf.Parse must not retain substrings of its input; the string must
+	// not be used after this call returns (the caller zeroes the buffer).
+	conf, err := wgconf.Parse(unsafe.String((*byte)(unsafe.Pointer(confText)), int(n)))
 	if err != nil {
 		return failCall(errConfig, errBuf, errLen, err.Error())
 	}

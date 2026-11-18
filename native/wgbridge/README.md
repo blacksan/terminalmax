@@ -61,8 +61,11 @@ char *wgbVersion(void);   /* static; do not free */
 * `wgbStats` writes
   `{"last_handshake_unix_ms":N,"rx_bytes":N,"tx_bytes":N}` plus, once a
   forwarder has failed, `,"last_forward_error":"..."` (ASCII, at most 120
-  characters). `last_handshake_unix_ms` is 0 if no handshake has completed.
-  Use a buffer of at least 512 bytes. Per-call errors go to `errBuf`.
+  characters) and, once wireguard-go has logged an error,
+  `,"last_device_error":"..."` (ASCII, at most 256 characters).
+  `last_handshake_unix_ms` is 0 if no handshake has completed. Use a buffer
+  of at least 768 bytes. **Poll stats sparingly** (at most every 5-10 s and
+  only while the UI is visible): see the key-handling note below. Per-call errors go to `errBuf`.
 * `wgbRebind` closes and reopens the tunnel's UDP socket (device down/up) so
   WireGuard re-handshakes immediately. Returns 0 or a negative code.
 * `wgbStop` closes forwarders, then the device. Unknown handles are ignored.
@@ -90,8 +93,9 @@ package org.terminalmax.core.wireguard
 
 object WgBridgeNative {
     init { System.loadLibrary("wgbridge") }
-    external fun nativeStart(config: ByteArray): Int      // handle > 0 or negative
-    external fun nativeLastError(): String                // message for the last failure
+    @Throws(java.io.IOException::class)
+    external fun nativeStart(config: ByteArray): Int      // handle > 0; throws on failure
+    external fun nativeLastError(): String                // process-global message of the last failure
     @Throws(java.io.IOException::class)
     external fun nativeOpenForward(handle: Int, target: String, tokenOut: ByteArray): Int // port; tokenOut.size must be 32
     @Throws(java.io.IOException::class)
@@ -103,8 +107,12 @@ object WgBridgeNative {
 
 * `nativeStart` takes the config as a `ByteArray` (ASCII/UTF-8) so that no
   immutable `String` copy of the keys is created. The native side copies it
-  to a malloc buffer, and zeroes both that copy and the array contents, so
-  treat the array as consumed (the Kotlin side should also `fill(0)` it).
+  with `GetByteArrayRegion` into one malloc buffer, which the bridge parses
+  in place and wipes before returning. It does **not** touch your array:
+  **the caller must `fill(0)` the config `ByteArray` after `nativeStart`
+  returns** (in a `finally`). On failure it throws `java.io.IOException` with
+  the per-call message (a NULL array also throws); it no longer depends on
+  `nativeLastError`.
 * `nativeOpenForward` and `nativeStats` throw `java.io.IOException` with the
   per-call message on failure (`nativeOpenForward` also returns the negative
   code if the exception is swallowed). A `tokenOut` that is not exactly 32
@@ -147,22 +155,35 @@ must:
   (`crypto/rand`) that the client must send first; it is compared in
   constant time before the target is dialled. A process that guesses wrong
   or stays silent never gets a byte into the tunnel, but it can still use up
-  the single accept slot, so the **residual risk is denial of service**
-  (the legitimate connect fails and must be retried with a new forward).
+  the single accept slot, so the **residual risk is denial of service**:
+  whoever connects first consumes the single slot, the legitimate client then
+  gets connection refused/reset, and the authentication failure surfaces
+  within 5 s as `forward: client failed authentication` (also in stats
+  `last_forward_error`). No bytes reach the tunnel. The caller simply calls
+  OpenForward again for a fresh port and token.
   The token only travels over loopback and in your process memory; do not
   log it. **SSH host-key verification remains mandatory**: the token
   protects the tunnel entry point, not the SSH session.
 * Key handling, honestly: keys never appear in error messages (parser
-  errors never echo key-like values), return values or logs, and wireguard-go
-  is configured with a logger that discards everything except errors (kept
-  in memory, never printed). But keys **remain in process memory for the
-  tunnel's lifetime** (wireguard-go holds them) and in garbage-collected
-  copies: Go strings and slices cannot be reliably erased. The bridge
-  minimises this: the UAPI text is built in a pre-sized buffer, zeroed after
-  it is applied, and `wgconf.Config` private/preshared keys are zeroed by
-  `tunnel.Start`; JNI config bytes and the C copies are zeroed; stats are
-  parsed from a stream that never stores key lines. Store keys in the
-  platform keystore and treat a memory dump of the app as exposing them.
+  errors redact any value with 16 or more base64/base64url/hex characters,
+  resolver text is never echoed), return values or logs, and wireguard-go is
+  configured with a logger that discards everything except errors (kept in
+  memory, surfaced ASCII-sanitised as `last_device_error`). **Keys remain in
+  process memory for the tunnel's lifetime**: wireguard-go keeps the private
+  and preshared keys, and it keeps unzeroed copies of the UAPI lines passed to
+  `IpcSet`. The bridge reduces what it controls: it parses the config in place
+  over the caller's buffer (no Go copy, `Parse` retains no substrings),
+  builds the UAPI text in a pre-sized buffer that it zeroes after use, zeroes
+  `wgconf.Config` keys (also on parse errors) and its own C buffer, and parses
+  stats from a stream that never stores key lines. But every stats call goes
+  through `IpcGet`, and wireguard-go serialises the private and preshared keys
+  into an internal pooled buffer each time, so poll stats sparingly (at most
+  every 5-10 s and only while the UI is visible). Go strings and slices
+  cannot be reliably erased, and the Kotlin caller must zero its own
+  `ByteArray`. Store keys in the platform keystore and treat a memory dump of
+  the app as exposing them.
+  TODO: reading rx/tx through a wrapping `conn.Bind` (counting bytes at the
+  UDP socket) would avoid `IpcGet` entirely.
 * wg-quick script hooks (`PreUp`, `PostUp`, ...) are rejected, not run.
 * Endpoint host names are resolved with the system resolver outside the
   tunnel; use IP endpoints if that leaks too much.

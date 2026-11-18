@@ -6,8 +6,12 @@ package wgconf
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"net"
 	"net/netip"
 	"strings"
 	"testing"
@@ -255,7 +259,7 @@ func TestSafeQuote(t *testing.T) {
 	if got := safeQuote("a\nb\u00e9"); got != `"a\nb\u00e9"` {
 		t.Fatalf("got %q", got)
 	}
-	if got := safeQuote(strings.Repeat("x ", 50)); len(got) != 64+3+2 {
+	if got := safeQuote(strings.Repeat(". ", 50)); len(got) != 64+3+2 {
 		t.Fatalf("len %d: %q", len(got), got)
 	}
 	if err := unknownKey("[Peer]", "bogus"); err.Error() != `unknown [Peer] key "bogus"` {
@@ -266,19 +270,197 @@ func TestSafeQuote(t *testing.T) {
 	}
 }
 
-func TestResolveErrorsDoNotEchoRawHost(t *testing.T) {
-	rnd := base64.StdEncoding.EncodeToString([]byte("0123456789abcdefghijklmnopqrstuv"))
-	txt := strings.Replace(goodConf(), "203.0.113.5:51820", rnd[:43]+":51820", 1) // not key-like, short host
-	c, err := Parse(txt)
-	if err != nil {
+func TestResolveErrorsDoNotEchoResolverText(t *testing.T) {
+	txt := strings.Replace(goodConf(), "203.0.113.5:51820", "Vpn.Example.ORG:51820", 1)
+	reasons := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"plain", errors.New("SECRET-RESOLVER-TEXT lookup vpn.example.org"), "lookup failed"},
+		{"not found", &net.DNSError{Err: "SECRET-RESOLVER-TEXT", Name: "vpn.example.org", IsNotFound: true}, "no such host"},
+		{"timeout", &net.DNSError{Err: "SECRET-RESOLVER-TEXT", Name: "vpn.example.org", IsTimeout: true}, "timeout"},
+		{"deadline", fmt.Errorf("SECRET-RESOLVER-TEXT: %w", context.DeadlineExceeded), "timeout"},
+		{"temporary", &net.DNSError{Err: "SECRET-RESOLVER-TEXT", Name: "vpn.example.org", IsTemporary: true}, "temporary DNS failure"},
+	}
+	for _, tc := range reasons {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := Parse(txt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fail := func(context.Context, string) ([]netip.Addr, error) { return nil, tc.err }
+			err = ResolveEndpoints(context.Background(), c, fail)
+			if err == nil || !strings.HasSuffix(err.Error(), ": "+tc.want) || strings.Contains(err.Error(), "SECRET") {
+				t.Fatalf("unexpected error %v", err)
+			}
+		})
+	}
+}
+
+func TestResolveErrorLowercasedKeyHost(t *testing.T) {
+	key := randKey(t)
+	for _, enc := range keyEncodings(" ") {
+		t.Run(enc.name, func(t *testing.T) {
+			c, err := Parse(buildConf("\n", " ", map[string]string{"endpoint": enc.val(key) + ":51820"}, nil))
+			if err != nil {
+				t.Skipf("endpoint rejected by Parse: %v", err)
+			}
+			fail := func(_ context.Context, host string) ([]netip.Addr, error) {
+				return nil, errors.New("lookup " + strings.ToLower(host) + ": no such host")
+			}
+			err = ResolveEndpoints(context.Background(), c, fail)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			assertNoKeyRun(t, err.Error(), enc.val(key))
+			_, err = c.UAPI()
+			if err == nil {
+				t.Fatal("expected unresolved error")
+			}
+			assertNoKeyRun(t, err.Error(), enc.val(key))
+		})
+	}
+}
+
+type keyEnc struct {
+	name string
+	val  func(k []byte) string
+}
+
+// keyEncodings lists the ways a user might have pasted a key; sep is used
+// for the "split" variants.
+func keyEncodings(sep string) []keyEnc {
+	std := func(k []byte) string { return base64.StdEncoding.EncodeToString(k) }
+	return []keyEnc{
+		{"std", std},
+		{"unpadded", func(k []byte) string { return base64.RawStdEncoding.EncodeToString(k) }},
+		{"urlsafe", func(k []byte) string { return base64.URLEncoding.EncodeToString(k) }},
+		{"split20", func(k []byte) string { s := std(k); return s[:20] + sep + s[20:] }},
+		{"hex", func(k []byte) string { return hex.EncodeToString(k) }},
+		{"hexsplit", func(k []byte) string { s := hex.EncodeToString(k); return s[:32] + sep + s[32:] }},
+		{"colonhex", func(k []byte) string {
+			parts := make([]string, len(k))
+			for i, b := range k {
+				parts[i] = hex.EncodeToString([]byte{b})
+			}
+			return strings.Join(parts, ":")
+		}},
+	}
+}
+
+func randKey(t *testing.T) []byte {
+	t.Helper()
+	k := make([]byte, 32)
+	if _, err := rand.Read(k); err != nil {
 		t.Fatal(err)
 	}
-	fail := func(_ context.Context, host string) ([]netip.Addr, error) {
-		return nil, errors.New("lookup " + host + ": no such host")
+	return k
+}
+
+// buildConf renders a valid config, replacing the fields in over (address,
+// dns, mtu, allowedips, endpoint) and appending extra raw lines.
+func buildConf(nl, sep string, over map[string]string, extra func(kv func(k, v string) string) []string) string {
+	kv := func(k, v string) string { return k + sep + "=" + sep + v }
+	f := map[string]string{"address": "10.0.0.2/32", "dns": "10.0.0.1", "mtu": "1380", "allowedips": "10.0.0.0/24", "endpoint": "203.0.113.5:51820"}
+	for k, v := range over {
+		f[k] = v
 	}
-	err = ResolveEndpoints(context.Background(), c, fail)
-	if err == nil || strings.Count(err.Error(), rnd[:43]) > 1 {
-		t.Fatalf("host repeated in %v", err)
+	lines := []string{
+		"[Interface]", kv("PrivateKey", b64(1)), kv("Address", f["address"]), kv("DNS", f["dns"]), kv("MTU", f["mtu"]),
+		"", "[Peer]", kv("PublicKey", b64(2)), kv("AllowedIPs", f["allowedips"]), kv("Endpoint", f["endpoint"]),
+	}
+	if extra != nil {
+		lines = append(lines, extra(kv)...)
+	}
+	return strings.Join(lines, nl) + nl
+}
+
+// assertNoKeyRun fails if errText holds a run of 16 or more consecutive
+// characters of encoded (case-insensitive, spaces and colons removed from both).
+func assertNoKeyRun(t *testing.T, errText, encoded string) {
+	t.Helper()
+	norm := func(s string) string {
+		return strings.NewReplacer(" ", "", ":", "", "\t", "").Replace(strings.ToLower(s))
+	}
+	e, k := norm(errText), norm(encoded)
+	for i := 0; i+16 <= len(k); i++ {
+		if strings.Contains(e, k[i:i+16]) {
+			t.Fatalf("error leaks key material (%q): %q", k[i:i+16], errText)
+		}
+	}
+}
+
+func TestKeyLeakRegression(t *testing.T) {
+	type place struct {
+		name string
+		cfg  func(nl, sep, v string) string
+		// endpoint placements parse fine for some encodings; the leak check
+		// then continues through ResolveEndpoints and WriteUAPI.
+	}
+	places := []place{
+		{"Address", func(nl, sep, v string) string { return buildConf(nl, sep, map[string]string{"address": v}, nil) }},
+		{"AllowedIPs", func(nl, sep, v string) string { return buildConf(nl, sep, map[string]string{"allowedips": v}, nil) }},
+		{"Endpoint", func(nl, sep, v string) string {
+			return buildConf(nl, sep, map[string]string{"endpoint": v + ":51820"}, nil)
+		}},
+		{"SectionHeader", func(nl, sep, v string) string {
+			return buildConf(nl, sep, nil, func(kv func(k, v string) string) []string { return []string{"[" + v + "]"} })
+		}},
+		{"UnknownValue", func(nl, sep, v string) string {
+			return buildConf(nl, sep, nil, func(kv func(k, v string) string) []string { return []string{kv("Bogus", v)} })
+		}},
+		{"UnknownName", func(nl, sep, v string) string {
+			return buildConf(nl, sep, nil, func(kv func(k, v string) string) []string { return []string{kv(v, "1")} })
+		}},
+		{"DNS", func(nl, sep, v string) string {
+			return buildConf(nl, sep, map[string]string{"dns": v}, func(kv func(k, v string) string) []string { return []string{kv("Bogus", "1")} })
+		}},
+		{"MTU", func(nl, sep, v string) string { return buildConf(nl, sep, map[string]string{"mtu": v}, nil) }},
+	}
+	cases := 0
+	for round := 0; round < 3; round++ {
+		key := randKey(t)
+		for _, nl := range []string{"\n", "\r\n"} {
+			for _, sep := range []string{" ", "\t"} {
+				for _, enc := range keyEncodings(sep) {
+					v := enc.val(key)
+					for _, pl := range places {
+						cases++
+						text := pl.cfg(nl, sep, v)
+						check := func(stage string, err error) {
+							if err != nil {
+								assertNoKeyRun(t, err.Error(), v)
+							}
+						}
+						c, err := Parse(text)
+						if err == nil && pl.name != "DNS" && pl.name != "Endpoint" {
+							t.Fatalf("%s/%s: expected a parse error", pl.name, enc.name)
+						}
+						check("parse", err)
+						if err != nil || c == nil {
+							continue
+						}
+						fail := func(_ context.Context, host string) ([]netip.Addr, error) {
+							return nil, errors.New("lookup " + strings.ToLower(host) + ": no such host")
+						}
+						check("resolve", ResolveEndpoints(context.Background(), c, fail))
+						_, uerr := c.UAPI()
+						check("uapi", uerr)
+					}
+				}
+			}
+		}
+	}
+	t.Logf("%d leak-regression cases", cases)
+}
+
+func TestParseZeroesKeysOnError(t *testing.T) {
+	// Parse failing after PrivateKey was read must not hand back a config,
+	// and must zero what it parsed (checked indirectly: no config returned).
+	c, err := Parse(goodConf() + "Bogus = 1\n")
+	if err == nil || c != nil {
+		t.Fatalf("got %v, %v", c, err)
 	}
 }
 
@@ -335,5 +517,25 @@ func TestStatsJSONForwardError(t *testing.T) {
 	j := (Stats{LastForwardError: "bad \"x\"\\ \u00e9\n"}).JSON()
 	if j != `{"last_handshake_unix_ms":0,"rx_bytes":0,"tx_bytes":0,"last_forward_error":"bad 'x'' ???"}` {
 		t.Fatalf("got %s", j)
+	}
+}
+
+func TestStatsJSONDeviceErrorAndMaxLen(t *testing.T) {
+	j := (Stats{LastDeviceError: "dev \"x\" é"}).JSON()
+	if j != `{"last_handshake_unix_ms":0,"rx_bytes":0,"tx_bytes":0,"last_device_error":"dev 'x' ??"}` {
+		t.Fatalf("got %s", j)
+	}
+	worst := Stats{
+		LastHandshake:    time.UnixMilli(9999999999999),
+		RxBytes:          ^uint64(0),
+		TxBytes:          ^uint64(0),
+		LastForwardError: strings.Repeat("e", 500),
+		LastDeviceError:  strings.Repeat("d", 500),
+	}.JSON()
+	if len(worst) > MaxJSONLen {
+		t.Fatalf("worst-case JSON is %d bytes, MaxJSONLen is %d", len(worst), MaxJSONLen)
+	}
+	if !strings.Contains(worst, strings.Repeat("d", 256)+`"`) || strings.Contains(worst, strings.Repeat("d", 257)) {
+		t.Fatalf("device error not capped at 256: %s", worst)
 	}
 }

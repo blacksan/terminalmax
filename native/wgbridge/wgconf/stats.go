@@ -17,6 +17,9 @@ type Stats struct {
 	// LastForwardError is the most recent forwarder error, if any. It is
 	// ASCII-sanitised by JSON.
 	LastForwardError string
+	// LastDeviceError is the most recent error logged by wireguard-go, if
+	// any. It is ASCII-sanitised by JSON.
+	LastDeviceError string
 }
 
 // SanitizeASCII replaces every byte outside printable ASCII (0x20..0x7e)
@@ -37,6 +40,22 @@ func SanitizeASCII(s string, max int) string {
 // maxForwardErrJSON bounds last_forward_error in the JSON output.
 const maxForwardErrJSON = 120
 
+// maxDeviceErrJSON bounds last_device_error in the JSON output.
+const maxDeviceErrJSON = 256
+
+// MaxJSONLen is an upper bound on the length of Stats.JSON output; callers
+// should provide a buffer of at least MaxJSONLen+1 bytes.
+const MaxJSONLen = 560
+
+func jsonString(s string, max int) string {
+	return strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' {
+			return '\''
+		}
+		return r
+	}, SanitizeASCII(s, max))
+}
+
 // JSON renders the stats as a small JSON object. The output is printable
 // ASCII only.
 func (s Stats) JSON() string {
@@ -48,13 +67,10 @@ func (s Stats) JSON() string {
 		`,"rx_bytes":` + strconv.FormatUint(s.RxBytes, 10) +
 		`,"tx_bytes":` + strconv.FormatUint(s.TxBytes, 10)
 	if s.LastForwardError != "" {
-		e := strings.Map(func(r rune) rune {
-			if r == '"' || r == '\\' {
-				return '\''
-			}
-			return r
-		}, SanitizeASCII(s.LastForwardError, maxForwardErrJSON))
-		out += `,"last_forward_error":"` + e + `"`
+		out += `,"last_forward_error":"` + jsonString(s.LastForwardError, maxForwardErrJSON) + `"`
+	}
+	if s.LastDeviceError != "" {
+		out += `,"last_device_error":"` + jsonString(s.LastDeviceError, maxDeviceErrJSON) + `"`
 	}
 	return out + `}`
 }
