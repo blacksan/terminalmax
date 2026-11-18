@@ -8,13 +8,13 @@ import com.sun.jna.Pointer
 import java.io.File
 
 /**
- * The C ABI exactly as exported by native/wgbridge/cmd/libwgbridge/main.go. `char *` and
- * `unsigned char *` parameters are byte arrays (JNA copies them in and back out); the config
- * is passed as a native [Pointer] so that it can be zeroed.
+ * The C ABI exactly as exported by native/wgbridge/cmd/libwgbridge/main.go. `char *` parameters
+ * without secrets are byte arrays (JNA copies them in and back out); the config and the forwarder
+ * token buffer are native [Pointer]s (JNA `Memory`) so that they can be zeroed after use.
  */
 internal interface WgBridgeLib : Library {
     fun wgbStart(confText: Pointer, errBuf: ByteArray, errLen: Int): Int
-    fun wgbOpenForward(handle: Int, target: ByteArray, tokenOut: ByteArray, errBuf: ByteArray, errLen: Int): Int
+    fun wgbOpenForward(handle: Int, target: ByteArray, tokenOut: Pointer, errBuf: ByteArray, errLen: Int): Int
     fun wgbStats(handle: Int, buf: ByteArray, length: Int, errBuf: ByteArray, errLen: Int): Int
     fun wgbRebind(handle: Int): Int
     fun wgbStop(handle: Int)
@@ -22,19 +22,8 @@ internal interface WgBridgeLib : Library {
     fun wgbVersion(): Pointer?
 }
 
-internal const val PATH_PROPERTY = "terminalmax.wgbridge.path"
-private const val RESOURCES_PROPERTY = "compose.application.resources.dir"
 private const val ERR_LEN = 512
 private const val STATS_LEN = 1024
-
-internal fun nativeLibraryFileName(osName: String): String {
-    val os = osName.lowercase()
-    return when {
-        os.contains("mac") || os.contains("darwin") -> "libwgbridge.dylib"
-        os.contains("win") -> "wgbridge.dll"
-        else -> "libwgbridge.so"
-    }
-}
 
 /** The holder keeps the proxy (and with it the JNA library handle) reachable forever: never unloaded. */
 private object LibraryHolder {
@@ -48,25 +37,55 @@ private object LibraryHolder {
         return loaded
     }
 
+    /**
+     * Packaged builds load the bridge ONLY from an absolute path inside the application's resources
+     * directory ([RESOURCES_PROPERTY]) and pin JNA's own native stub to the copy bundled next to it
+     * (`jna.boot.library.path`, `jna.nounpack`, `jna.nosys`): nothing is searched, nothing is
+     * extracted to a temp directory. There is no fall-back to the default JNA search.
+     *
+     * Only with `-Dterminalmax.dev=true` may [PATH_PROPERTY] name another library (tests, the e2e
+     * job, `./gradlew run`). JNA properties are set here, before the first JNA class is
+     * initialised, so this must be the first JNA user in the process.
+     */
     private fun load(): WgBridgeLib {
-        try {
-            val explicit = System.getProperty(PATH_PROPERTY)
-            if (!explicit.isNullOrEmpty()) {
-                val file = File(explicit)
-                if (!file.isAbsolute || !file.isFile) {
-                    throw WireGuardException("wgbridge: $PATH_PROPERTY must be an absolute path of an existing file")
-                }
-                return Native.load(file.path, WgBridgeLib::class.java)
+        val os = System.getProperty("os.name") ?: ""
+        val dev = isDevMode()
+        val explicit = System.getProperty(PATH_PROPERTY)
+        val library: File
+        if (!explicit.isNullOrEmpty()) {
+            if (!dev) {
+                throw WireGuardException("wgbridge: $PATH_PROPERTY is only honoured together with -D$DEV_PROPERTY=true")
             }
+            library = resolveDevLibrary(explicit)
+            useJnaDefaultsForDev(os)
+        } else {
             val resources = System.getProperty(RESOURCES_PROPERTY)
-            if (!resources.isNullOrEmpty()) {
-                val file = File(resources, nativeLibraryFileName(System.getProperty("os.name") ?: ""))
-                if (file.isFile) return Native.load(file.absolutePath, WgBridgeLib::class.java)
+            library = resolveBundledFile(resources, nativeLibraryFileName(os), "native library")
+            if (dev) {
+                val dispatch = try {
+                    resolveBundledFile(resources, jnaDispatchFileName(os), "JNA stub")
+                } catch (_: WireGuardException) {
+                    null
+                }
+                if (dispatch != null) pinJnaDispatch(dispatch) else useJnaDefaultsForDev(os)
+            } else {
+                pinJnaDispatch(resolveBundledFile(resources, jnaDispatchFileName(os), "JNA stub"))
             }
-            // Default JNA search: jna.library.path, the OS library path, the classpath.
-            return Native.load("wgbridge", WgBridgeLib::class.java)
-        } catch (e: UnsatisfiedLinkError) {
+        }
+        try {
+            return Native.load(library.path, WgBridgeLib::class.java)
+        } catch (e: LinkageError) {
             throw WireGuardException("wgbridge: native library could not be loaded", e)
+        }
+    }
+
+    /** Dev mode without a bundled JNA stub: let JNA extract it, but into a private directory. */
+    private fun useJnaDefaultsForDev(os: String) {
+        if (System.getProperty("jna.tmpdir").isNullOrEmpty()) {
+            System.setProperty(
+                "jna.tmpdir",
+                privateJnaTmpDir(os, System.getenv(), System.getProperty("user.home") ?: "").path,
+            )
         }
     }
 }
@@ -105,9 +124,19 @@ private class JnaWgNative(private val lib: WgBridgeLib) : WgNative {
     override fun openForward(handle: Int, target: String, tokenOut: ByteArray): Int {
         val targetBytes = (target + "\u0000").toByteArray(Charsets.US_ASCII)
         val err = ByteArray(ERR_LEN)
-        val rc = lib.wgbOpenForward(handle, targetBytes, tokenOut, err, err.size)
-        if (rc <= 0) fail(err, "open forward", rc)
-        return rc
+        // JNA would copy a ByteArray argument through a temporary native buffer that it frees without
+        // zeroing; a Memory block is wiped explicitly.
+        val tokenMem = Memory(tokenOut.size.toLong())
+        try {
+            tokenMem.clear()
+            val rc = lib.wgbOpenForward(handle, targetBytes, tokenMem, err, err.size)
+            if (rc <= 0) fail(err, "open forward", rc)
+            tokenMem.read(0, tokenOut, 0, tokenOut.size)
+            return rc
+        } finally {
+            tokenMem.clear()
+            tokenMem.close()
+        }
     }
 
     override fun stats(handle: Int): String {

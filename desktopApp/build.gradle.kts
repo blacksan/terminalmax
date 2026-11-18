@@ -31,6 +31,44 @@ dependencies {
     runtimeOnly(libs.slf4j.nop)
 }
 
+// JNA's own native stub (jnidispatch) is shipped next to libwgbridge so that JNA never extracts it to a
+// temp directory or searches for it (see core/wireguard/README.md). It is taken from the very JNA jar
+// that the app runs with, so the versions always match.
+val jnaDispatchJar by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+}
+
+dependencies {
+    add(jnaDispatchJar.name, "net.java.dev.jna:jna:${libs.versions.jna.get()}")
+}
+
+// Copies into the same resources/<os>-<arch>/ folders that CI fills with the bridge. Only the two
+// shipped platforms exist. A Copy (not Sync) task: it must never delete the bridge next to it.
+val bundleJnaDispatch by tasks.registering(Copy::class) {
+    description = "Copies JNA's jnidispatch for macOS arm64 and Windows x64 into the app resources."
+    // singleFile: the jna jar has no dependencies. Resolved while configuring (configuration cache friendly).
+    from(zipTree(jnaDispatchJar.singleFile)) {
+        include(
+            "com/sun/jna/darwin-aarch64/libjnidispatch.jnilib",
+            "com/sun/jna/win32-x86-64/jnidispatch.dll",
+        )
+        eachFile {
+            path = (if (sourcePath.contains("darwin-aarch64")) "macos-arm64/" else "windows-x64/") + name
+        }
+    }
+    includeEmptyDirs = false
+    into(layout.projectDirectory.dir("resources"))
+}
+
+// Packaging, the runnable distribution and `run` all read resources/; make sure the stub is there first.
+tasks.matching {
+    it.name == "prepareAppResources" || it.name == "run" ||
+        it.name.startsWith("package") || it.name.startsWith("createDistributable")
+}.configureEach {
+    dependsOn(bundleJnaDispatch)
+}
+
 compose.desktop {
     application {
         mainClass = "org.terminalmax.desktop.MainKt"
@@ -42,8 +80,9 @@ compose.desktop {
             packageVersion = "1.0.0"
             licenseFile.set(rootProject.file("LICENSE"))
             // CI copies the freshly built libwgbridge.dylib / wgbridge.dll into
-            // resources/macos-arm64/ and resources/windows-x64/ before packaging; the app finds
-            // them through the compose.application.resources.dir system property.
+            // resources/macos-arm64/ and resources/windows-x64/ before packaging; bundleJnaDispatch
+            // (above) adds JNA's jnidispatch next to them. The app finds both only through the
+            // compose.application.resources.dir system property (no search path, no temp extraction).
             appResourcesRootDir.set(project.layout.projectDirectory.dir("resources"))
             // JNA needs sun.misc.Unsafe-style access (jdk.unsupported) and java.logging in the jlink image.
             modules("jdk.unsupported", "java.logging")

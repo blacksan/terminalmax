@@ -3,9 +3,13 @@ package org.terminalmax.integration
 
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetSocketAddress
 import java.security.KeyPairGenerator
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.concurrent.thread
 import org.apache.sshd.common.keyprovider.KeyPairProvider
+import org.apache.sshd.common.session.Session
+import org.apache.sshd.common.session.SessionListener
 import org.apache.sshd.server.Environment
 import org.apache.sshd.server.ExitCallback
 import org.apache.sshd.server.ServerBuilder
@@ -22,11 +26,18 @@ const val E2E_PASSWORD = "s3cret"
 /**
  * Embedded Apache MINA SSHD bound to [host] (the kernel WireGuard peer address) on an
  * OS-assigned port, with in-process commands: "echo x" prints x, the shell answers "got:<line>".
+ * It records the peer address of every TCP connection it accepts ([clientAddresses]), so a test
+ * can prove which source address the server really saw.
  */
 class EmbeddedSshd(host: String) : AutoCloseable {
     private val server: SshServer = ServerBuilder.builder().build()
 
     val port: Int get() = server.port
+
+    /** Peer IP address (as text) of every connection accepted so far, in order. */
+    val clientAddresses: List<String> get() = peers.toList()
+
+    private val peers = CopyOnWriteArrayList<String>()
 
     init {
         server.setHost(host)
@@ -38,6 +49,12 @@ class EmbeddedSshd(host: String) : AutoCloseable {
         )
         server.setCommandFactory(CommandFactory { _, command -> EchoExecCommand(command) })
         server.setShellFactory(ShellFactory { _ -> LineEchoShell() })
+        server.addSessionListener(object : SessionListener {
+            override fun sessionCreated(session: Session) {
+                val remote = session.remoteAddress
+                peers.add((remote as? InetSocketAddress)?.address?.hostAddress ?: remote.toString())
+            }
+        })
         server.start()
         check(server.port > 0) { "MINA did not report the bound port" }
     }

@@ -43,6 +43,13 @@ interface WireGuardTunnel : AutoCloseable {
      * Opens a one-connection loopback forwarder to [targetIp]:[port] through the tunnel. Open it
      * immediately before connecting: it expires after 5 s without a client, and the client has
      * 5 s to send the token. [targetIp] must be an IP literal (IPv4 or IPv6, without brackets).
+     *
+     * The tunnel wipes the token of every forward it handed out when it is closed (and of the
+     * oldest ones once more than 64 are outstanding): read [LoopbackForward.token] right away.
+     *
+     * @throws IllegalArgumentException if [targetIp] is not an IP literal or [port] is not in 1..65535
+     *   (checked before anything reaches the native bridge).
+     * @throws WireGuardException if the tunnel is closed or the bridge cannot open the forwarder.
      */
     fun openForward(targetIp: String, port: Int): LoopbackForward
 
@@ -64,8 +71,9 @@ interface WireGuardTunnel : AutoCloseable {
  * A loopback listener on `127.0.0.1:[port]` that accepts one connection. The client must send
  * [token] (32 bytes) first; with `:core:ssh` pass both to `LoopbackPreamble(port, token)`.
  *
- * The token is copied on construction and on every read of [token]; call [wipe] when done.
- * [toString] never shows it.
+ * The token is copied on construction and on every read of [token]; call [wipe] when done (the
+ * tunnel that created the forward also wipes it when the tunnel is closed). [toString] never
+ * shows it.
  */
 class LoopbackForward(val port: Int, token: ByteArray) {
     private val stored: ByteArray
@@ -109,7 +117,7 @@ data class TunnelStats(
 /**
  * Creates the platform backend. On Android this loads `libwgbridge.so` from the APK through
  * JNI; on the desktop it binds the shared library through JNA (see the module README for the
- * lookup order). Loading happens once per process and the library is never unloaded.
+ * lookup rules). Loading happens once per process and the library is never unloaded.
  *
  * @throws WireGuardException if the native library cannot be found or loaded.
  */

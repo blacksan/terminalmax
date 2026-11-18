@@ -29,6 +29,8 @@ dependencies {
 
 tasks.test {
     useJUnit()
+    // The desktop loader honours terminalmax.wgbridge.path only together with this flag.
+    systemProperty("terminalmax.dev", "true")
     // Never reuse a cached or up-to-date result: the outcome depends on the runner's network setup.
     outputs.upToDateWhen { false }
     outputs.cacheIf { false }

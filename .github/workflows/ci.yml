@@ -1,3 +1,6 @@
+# Third-party actions are pinned to full commit SHAs (the version is in the trailing comment);
+# Dependabot (.github/dependabot.yml) proposes bumps. The artifacts uploaded here are UNSIGNED
+# debug/CI builds of every branch push: treat them as untrusted and never release from this workflow.
 name: CI
 
 on:
@@ -15,14 +18,14 @@ jobs:
   android:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: 21
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.24.x"
           cache: false
@@ -42,7 +45,7 @@ jobs:
             cp "native/wgbridge/out/android/$abi/libwgbridge.so" "androidApp/src/main/jniLibs/$abi/libwgbridge.so"
           done
           find androidApp/src/main/jniLibs -type f
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
       - name: Build debug APK and run tests
         run: ./gradlew :androidApp:assembleDebug desktopTest --continue
       # Unsigned is fine: this only makes R8 (and the consumer keep rules) actually run.
@@ -68,9 +71,17 @@ jobs:
                 exit 1
               fi
             done
+            # The JNI class and its native method names must survive R8 (consumer keep rule).
+            unzip -p "$apk" 'classes*.dex' > "$RUNNER_TEMP/classes.dex.bin"
+            for sym in 'Lorg/terminalmax/core/wireguard/WgBridgeNative;' nativeStart nativeOpenForward nativeStats nativeRebind nativeStop; do
+              if ! grep -aq -- "$sym" "$RUNNER_TEMP/classes.dex.bin"; then
+                echo "::error::$apk lost $sym (R8 keep rule not applied?)"
+                exit 1
+              fi
+            done
             echo "OK: $apk"
           done
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terminalmax-debug-apk
           path: androidApp/build/outputs/apk/debug/*.apk
@@ -79,14 +90,14 @@ jobs:
   desktop-macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: 21
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.24.x"
           cache: false
@@ -99,17 +110,38 @@ jobs:
           set -euo pipefail
           mkdir -p desktopApp/resources/macos-arm64
           cp native/wgbridge/out/macos-arm64/libwgbridge.dylib desktopApp/resources/macos-arm64/
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
       - name: Package desktop distribution
         run: ./gradlew :desktopApp:packageDistributionForCurrentOS --stacktrace
-      - name: Assert the packaged app contains libwgbridge.dylib
+      # Inspect the final .dmg itself (mounted read-only), not the intermediate copies under build/compose.
+      - name: Assert the DMG contains libwgbridge.dylib and the JNA stub
         shell: bash
         run: |
           set -euo pipefail
-          found="$(find desktopApp/build/compose -name libwgbridge.dylib -print)"
-          [ -n "$found" ] || { echo "::error::libwgbridge.dylib missing from the packaged app"; exit 1; }
-          echo "$found"
-      - uses: actions/upload-artifact@v7
+          shopt -s nullglob
+          dmgs=(desktopApp/build/compose/binaries/main/dmg/*.dmg)
+          [ "${#dmgs[@]}" -eq 1 ] || { echo "::error::expected exactly one .dmg, found: ${dmgs[*]:-none}"; exit 1; }
+          mnt="$(mktemp -d "$RUNNER_TEMP/tmx-dmg.XXXXXX")"
+          detach() { hdiutil detach "$mnt" -quiet || hdiutil detach "$mnt" -force -quiet || true; }
+          trap detach EXIT
+          # The DMG carries a license agreement (licenseFile): answer its prompt on stdin.
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "${dmgs[0]}" <<<"Y"
+          app="$(find "$mnt" -maxdepth 1 -name '*.app' -print -quit)"
+          [ -n "$app" ] || { echo "::error::no .app inside ${dmgs[0]}"; ls -la "$mnt"; exit 1; }
+          res="$app/Contents/app/resources"
+          for f in libwgbridge.dylib libjnidispatch.jnilib; do
+            if [ ! -f "$res/$f" ]; then
+              echo "::error::$f missing from $res inside the DMG"
+              find "$app" \( -name '*wgbridge*' -o -name '*jnidispatch*' \) -print
+              exit 1
+            fi
+            file "$res/$f"
+            codesign -dv "$res/$f" 2>&1 | head -n 5 || true
+          done
+          file "$res/libwgbridge.dylib" | grep -q arm64 || { echo "::error::libwgbridge.dylib is not arm64"; exit 1; }
+          codesign --verify --strict "$res/libwgbridge.dylib"
+          echo "OK: $app"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terminalmax-macos-arm64-dmg
           path: desktopApp/build/compose/binaries/main/dmg/*.dmg
@@ -118,14 +150,14 @@ jobs:
   desktop-windows:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: 21
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.24.x"
           cache: false
@@ -138,18 +170,35 @@ jobs:
           set -euo pipefail
           mkdir -p desktopApp/resources/windows-x64
           cp native/wgbridge/out/windows-x64/wgbridge.dll desktopApp/resources/windows-x64/
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
       - name: Package desktop distribution
         run: ./gradlew :desktopApp:packageDistributionForCurrentOS --stacktrace
         shell: bash
-      - name: Assert the packaged app contains wgbridge.dll
-        shell: bash
+      # Administrative install (msiexec /a) extracts the files of the final .msi without installing it.
+      - name: Assert the MSI contains wgbridge.dll and the JNA stub
+        shell: pwsh
         run: |
-          set -euo pipefail
-          found="$(find desktopApp/build/compose -name wgbridge.dll -print)"
-          [ -n "$found" ] || { echo "::error::wgbridge.dll missing from the packaged app"; exit 1; }
-          echo "$found"
-      - uses: actions/upload-artifact@v7
+          $ErrorActionPreference = 'Stop'
+          $msis = @(Get-ChildItem -Path 'desktopApp/build/compose/binaries/main/msi' -Filter '*.msi')
+          if ($msis.Count -ne 1) { throw "expected exactly one .msi, found $($msis.Count)" }
+          $msi = $msis[0].FullName
+          $target = Join-Path $env:RUNNER_TEMP 'tmx-msi'
+          $log = Join-Path $env:RUNNER_TEMP 'tmx-msi.log'
+          $p = Start-Process -FilePath 'msiexec.exe' -Wait -PassThru -ArgumentList "/a `"$msi`" /qn TARGETDIR=`"$target`" /l*v `"$log`""
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            Get-Content $log -Tail 60
+            throw "msiexec /a failed with exit code $($p.ExitCode)"
+          }
+          foreach ($name in @('wgbridge.dll', 'jnidispatch.dll')) {
+            $hits = @(Get-ChildItem -Path $target -Recurse -File -Filter $name |
+              Where-Object { $_.FullName -match '\\app\\resources\\[^\\]+$' })
+            if ($hits.Count -ne 1) {
+              Get-ChildItem -Path $target -Recurse -File | Select-Object -ExpandProperty FullName
+              throw "$name: expected exactly one copy under app\resources inside the MSI, found $($hits.Count)"
+            }
+            Write-Host "OK: $($hits[0].FullName) ($($hits[0].Length) bytes)"
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terminalmax-windows-x64-msi
           path: desktopApp/build/compose/binaries/main/msi/*.msi
@@ -162,14 +211,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: 21
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.24.x"
           cache: false
@@ -223,9 +272,10 @@ jobs:
           echo "TMX_WG_CONFIG=$d/client.conf" >> "$GITHUB_ENV"
           echo "TMX_WGBRIDGE_LIB=$GITHUB_WORKSPACE/native/wgbridge/out/linux-x64/libwgbridge.so" >> "$GITHUB_ENV"
           echo "TMX_WG_SERVER_IP=10.99.0.1" >> "$GITHUB_ENV"
+          echo "TMX_WG_CLIENT_IP=10.99.0.2" >> "$GITHUB_ENV"
           sudo wg show tmxwg0
           ip -br addr show tmxwg0
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
       - name: Run the end-to-end tunnel test
         env:
           TMX_E2E: "1"
@@ -235,16 +285,25 @@ jobs:
           set -euo pipefail
           xml=integration-tests/build/test-results/test/TEST-org.terminalmax.integration.TunnelEndToEndTest.xml
           [ -f "$xml" ] || { echo "::error::missing $xml"; exit 1; }
-          grep -q 'tests="4"' "$xml" || { echo "::error::expected 4 tests"; exit 1; }
-          grep -q 'failures="0"' "$xml" || { echo "::error::failures reported"; exit 1; }
+          suite="$(grep -m1 '<testsuite ' "$xml")"
+          for attr in 'tests="4"' 'skipped="0"' 'failures="0"' 'errors="0"'; do
+            grep -q " $attr" <<<"$suite" || { echo "::error::test report lacks $attr: $suite"; exit 1; }
+          done
           grep -q 'wgbridge version:' "$xml" || { echo "::error::the native bridge was never loaded (test skipped?)"; exit 1; }
+      # Independent of the JVM: the kernel peer itself must have exchanged data with the client.
+      - name: Check the kernel peer saw tunnel traffic
+        run: |
+          set -euo pipefail
+          sudo wg show tmxwg0 transfer
+          sudo wg show tmxwg0 transfer | awk '{ if ($2 > 0 && $3 > 0) ok = 1 } END { exit ok ? 0 : 1 }' \
+            || { echo "::error::kernel peer transferred no data in both directions"; exit 1; }
       - name: Diagnostics
         if: failure()
         run: |
           sudo wg show || true
           ip -br addr || true
           uname -r
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: e2e-tunnel-test-report

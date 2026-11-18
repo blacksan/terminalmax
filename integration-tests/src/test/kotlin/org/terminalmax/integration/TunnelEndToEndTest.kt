@@ -40,10 +40,15 @@ import org.terminalmax.core.wireguard.createWireGuardBackend
  *  - TMX_WG_CONFIG:    path of the client wg-quick config
  *  - TMX_WGBRIDGE_LIB: absolute path of libwgbridge.so
  *  - TMX_WG_SERVER_IP: address of the kernel peer (default 10.99.0.1)
+ *  - TMX_WG_CLIENT_IP: tunnel address of the client config (default 10.99.0.2)
+ *
+ * The library is loaded through `terminalmax.wgbridge.path`, which the desktop loader honours only
+ * together with `-Dterminalmax.dev=true`; Gradle sets that for this module's test task.
  */
 class TunnelEndToEndTest {
     private val enabled = System.getenv("TMX_E2E") == "1"
     private val serverIp = System.getenv("TMX_WG_SERVER_IP") ?: "10.99.0.1"
+    private val clientIp = System.getenv("TMX_WG_CLIENT_IP") ?: "10.99.0.2"
 
     private var sshd: EmbeddedSshd? = null
     private var tunnel: WireGuardTunnel? = null
@@ -71,6 +76,11 @@ class TunnelEndToEndTest {
         val configPath = requireEnv("TMX_WG_CONFIG")
         assertTrue(File(libPath).isFile, "native library not found: $libPath")
         assertTrue(File(configPath).isFile, "wireguard client config not found: $configPath")
+        assertEquals(
+            "true",
+            System.getProperty("terminalmax.dev"),
+            "the test JVM must run with -Dterminalmax.dev=true (set by integration-tests/build.gradle.kts)",
+        )
         System.setProperty("terminalmax.wgbridge.path", libPath)
 
         sshd = EmbeddedSshd(serverIp)
@@ -137,6 +147,12 @@ class TunnelEndToEndTest {
             } finally {
                 session.close()
             }
+
+            // The server must have seen the tunnel address as the client, not 127.0.0.1: only traffic
+            // that really crossed wireguard-go and the kernel peer carries it as its source.
+            val peers = sshd!!.clientAddresses
+            assertTrue(peers.isNotEmpty(), "the embedded sshd accepted no connection")
+            assertTrue(peers.all { it == clientIp }, "sshd saw client addresses $peers, expected only $clientIp")
 
             val stats = t.stats()
             assertNotNull(stats.lastHandshakeEpochSeconds, "no WireGuard handshake completed: $stats")

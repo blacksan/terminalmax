@@ -54,18 +54,33 @@ internal class NativeWireGuardTunnel(
     private val lock = ReentrantReadWriteLock()
     private var closed = false
 
+    /** Forwards handed out by this tunnel; their tokens are wiped when the tunnel closes. */
+    private val forwards = ArrayDeque<LoopbackForward>()
+
     private inline fun <T> live(block: () -> T): T = lock.read {
         if (closed) throw WireGuardException("wgbridge: tunnel is closed")
         block()
+    }
+
+    /** Called while holding the read lock, so it can never race with [close]. */
+    private fun track(forward: LoopbackForward): LoopbackForward {
+        synchronized(forwards) {
+            // A forward expires after 5 s without a client, so the oldest tokens are long useless.
+            while (forwards.size >= MAX_TRACKED_FORWARDS) forwards.removeFirst().wipe()
+            forwards.addLast(forward)
+        }
+        return forward
     }
 
     override fun openForward(targetIp: String, port: Int): LoopbackForward {
         val target = formatForwardTarget(targetIp, port)
         val token = ByteArray(LoopbackForward.TOKEN_SIZE)
         try {
-            val localPort = live { native.openForward(handle, target, token) }
-            if (localPort !in 1..65535) throw WireGuardException("wgbridge: invalid forward port ($localPort)")
-            return LoopbackForward(localPort, token)
+            return live {
+                val localPort = native.openForward(handle, target, token)
+                if (localPort !in 1..65535) throw WireGuardException("wgbridge: invalid forward port ($localPort)")
+                track(LoopbackForward(localPort, token))
+            }
         } finally {
             token.fill(0)
         }
@@ -81,7 +96,18 @@ internal class NativeWireGuardTunnel(
         lock.write {
             if (closed) return
             closed = true
-            native.stop(handle)
+            try {
+                native.stop(handle)
+            } finally {
+                synchronized(forwards) {
+                    forwards.forEach { it.wipe() }
+                    forwards.clear()
+                }
+            }
         }
+    }
+
+    private companion object {
+        const val MAX_TRACKED_FORWARDS = 64
     }
 }

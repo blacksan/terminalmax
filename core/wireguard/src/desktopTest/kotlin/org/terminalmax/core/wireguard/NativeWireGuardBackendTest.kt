@@ -97,6 +97,17 @@ class NativeWireGuardBackendTest {
     }
 
     @Test
+    fun closeWipesTheTokensOfEveryForward() {
+        val tunnel = NativeWireGuardBackend(FakeNative()).start("x".toByteArray())
+        val a = tunnel.openForward("10.99.0.1", 22)
+        val b = tunnel.openForward("10.99.0.1", 22)
+        assertTrue(a.token.all { it == 5.toByte() })
+        tunnel.close()
+        assertTrue(a.token.all { it == 0.toByte() })
+        assertTrue(b.token.all { it == 0.toByte() })
+    }
+
+    @Test
     fun libraryFileNameByOs() {
         assertEquals("libwgbridge.dylib", nativeLibraryFileName("Mac OS X"))
         assertEquals("wgbridge.dll", nativeLibraryFileName("Windows 11"))
