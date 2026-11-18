@@ -1,0 +1,123 @@
+name: native
+
+on:
+  push:
+    paths:
+      - "native/**"
+      - ".github/workflows/native.yml"
+  pull_request:
+    paths:
+      - "native/**"
+      - ".github/workflows/native.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: native/wgbridge
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      # go.sum is not committed yet. Once it is, replace this step with
+      # `go mod download && go mod verify && go mod tidy -diff`.
+      - name: go mod tidy
+        run: go mod tidy
+      - name: go vet
+        run: go vet ./...
+      - name: go test (unit tests, race detector)
+        run: go test ./wgconf/ ./forward/ ./cmd/... -race -count=1
+      # The tunnel integration test runs two real wireguard-go devices over
+      # loopback UDP; it is kept out of the -race run on purpose.
+      - name: go test (tunnel integration, no race detector)
+        run: go test ./tunnel/ -count=1 -timeout 180s -v
+      - name: Upload go.mod / go.sum
+        uses: actions/upload-artifact@v5
+        with:
+          name: go-mod-files
+          path: |
+            native/wgbridge/go.mod
+            native/wgbridge/go.sum
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      # TODO: replace with `go mod download && go mod verify && go mod tidy -diff`
+      # once go.sum is committed.
+      - name: go mod tidy
+        run: go mod tidy
+      - name: Build libwgbridge.so
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./build-android.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: libwgbridge-android
+          path: native/wgbridge/out/android/
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      # TODO: replace with `go mod download && go mod verify && go mod tidy -diff`
+      # once go.sum is committed.
+      - name: go mod tidy
+        run: go mod tidy
+      - name: Build libwgbridge.dylib
+        shell: bash
+        run: ./build-desktop.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: libwgbridge-macos-arm64
+          path: native/wgbridge/out/macos-arm64/
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      # TODO: replace with `go mod download && go mod verify && go mod tidy -diff`
+      # once go.sum is committed.
+      - name: go mod tidy
+        shell: bash
+        run: go mod tidy
+      - name: Build wgbridge.dll
+        shell: bash
+        run: ./build-desktop.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: libwgbridge-windows-x64
+          path: native/wgbridge/out/windows-x64/
+          if-no-files-found: error
