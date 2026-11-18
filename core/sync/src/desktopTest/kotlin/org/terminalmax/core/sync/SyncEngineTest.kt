@@ -538,7 +538,12 @@ class SyncEngineTest {
         a.edit { it.upsertHost(host("from A"), id = "a1") }
         assertEquals(SyncOutcome.Pushed, a.sync())
         val revision = a.content.revision
-        b.edit { it.upsertHost(host("from B"), id = "b1") }
+        // A's push advanced its revision by more than one edit; edit B until both sit at the same revision.
+        var edits = 0
+        while (b.content.revision < revision && edits < 10) {
+            b.edit { it.upsertHost(host("from B ${edits + 1}"), id = "b1") }
+            edits++
+        }
         assertEquals(revision, b.content.revision, "both devices wrote the same revision")
         s.files[FakeDavServer.VAULT] = b.hooks.encrypt(b.content, null).bytes // a different file, same revision
 
