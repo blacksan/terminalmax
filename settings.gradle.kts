@@ -12,6 +12,11 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // JediTerm's emulator core is published only to the JetBrains repository.
+        maven {
+            url = uri("https://packages.jetbrains.team/maven/p/ij/intellij-dependencies")
+            content { includeGroup("org.jetbrains.jediterm") }
+        }
     }
 }
 
@@ -22,5 +27,7 @@ rootProject.name = "terminalmax"
 include(":androidApp")
 include(":desktopApp")
 include(":core:model")
+include(":core:ssh")
 include(":core:designsystem")
+include(":core:terminal")
 include(":feature:proof")

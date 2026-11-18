@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -19,12 +20,16 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import org.terminalmax.core.designsystem.theme.AppTheme
 import org.terminalmax.core.model.HostId
+import org.terminalmax.core.terminal.createTerminalEngine
+import org.terminalmax.core.terminal.ui.TerminalView
 
 const val PROOF_APP_NAME = "TerminalMax"
 
@@ -71,6 +76,24 @@ fun ProofScreen() {
                 fontFamily = FontFamily.Monospace,
                 style = MaterialTheme.typography.bodyMedium,
             )
+            TerminalSection()
         }
     }
+}
+
+/** Terminal spike: shared Canvas renderer over the JediTerm-backed engine, with local echo. */
+@Composable
+private fun TerminalSection() {
+    val engine = remember {
+        createTerminalEngine(cols = 80, rows = 12).also { it.feed(terminalDemoBytes()) }
+    }
+    DisposableEffect(engine) { onDispose { engine.close() } }
+    Text("Terminal", style = MaterialTheme.typography.titleMedium)
+    TerminalView(
+        engine = engine,
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(240.dp),
+        onInput = { bytes -> engine.feed(terminalDemoEcho(bytes)) },
+    )
 }

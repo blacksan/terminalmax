@@ -10,6 +10,11 @@ activityCompose = "1.13.0"
 compileSdk = "37"
 targetSdk = "37"
 minSdk = "26"
+jediterm = "3.76"
+sshj = "0.41.2"
+bouncycastle = "1.84"
+slf4j = "2.0.17"
+minaSshd = "2.20.1"
 
 [libraries]
 # Build-logic classpath
@@ -34,6 +39,13 @@ kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-c
 kotlinx-coroutines-swing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-swing", version.ref = "coroutines" }
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+jediterm-core = { module = "org.jetbrains.jediterm:jediterm-core", version.ref = "jediterm" }
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+sshj = { module = "com.hierynomus:sshj", version.ref = "sshj" }
+bouncycastle-bcprov = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = "bouncycastle" }
+bouncycastle-bcpkix = { module = "org.bouncycastle:bcpkix-jdk18on", version.ref = "bouncycastle" }
+slf4j-nop = { module = "org.slf4j:slf4j-nop", version.ref = "slf4j" }
+mina-sshd-core = { module = "org.apache.sshd:sshd-core", version.ref = "minaSshd" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
