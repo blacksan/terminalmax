@@ -30,9 +30,9 @@ jobs:
           go-version: "1.24.x"
           cache: false
       # go.sum is not committed yet (see native.yml).
-      - name: go mod tidy
+      - name: go mod download && go mod verify
         working-directory: native/wgbridge
-        run: go mod tidy
+        run: go mod download && go mod verify
       - name: Build libwgbridge.so (arm64-v8a, x86_64)
         working-directory: native/wgbridge
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./build-android.sh
@@ -103,7 +103,7 @@ jobs:
           cache: false
       - name: Build libwgbridge.dylib
         shell: bash
-        run: cd native/wgbridge && go mod tidy && bash build-desktop.sh
+        run: cd native/wgbridge && go mod download && go mod verify && bash build-desktop.sh
       - name: Copy libwgbridge.dylib into the app resources
         shell: bash
         run: |
@@ -163,7 +163,7 @@ jobs:
           cache: false
       - name: Build wgbridge.dll
         shell: bash
-        run: cd native/wgbridge && go mod tidy && bash build-desktop.sh
+        run: cd native/wgbridge && go mod download && go mod verify && bash build-desktop.sh
       - name: Copy wgbridge.dll into the app resources
         shell: bash
         run: |
@@ -224,7 +224,7 @@ jobs:
           cache: false
       - name: Build libwgbridge.so (linux/amd64)
         working-directory: native/wgbridge
-        run: go mod tidy && bash build-desktop.sh
+        run: go mod download && go mod verify && bash build-desktop.sh
       - name: Create the kernel WireGuard peer
         run: |
           set -euo pipefail

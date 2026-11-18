@@ -34,8 +34,8 @@ jobs:
           cache: false
       # go.sum is not committed yet. Once it is, replace this step with
       # `go mod download && go mod verify && go mod tidy -diff`.
-      - name: go mod tidy
-        run: go mod tidy
+      - name: go mod download && go mod verify
+        run: go mod download && go mod verify
       - name: go vet
         run: go vet ./...
       - name: go test (unit tests, race detector)
@@ -77,8 +77,8 @@ jobs:
           cache: false
       # TODO: replace with `go mod download && go mod verify && go mod tidy -diff`
       # once go.sum is committed.
-      - name: go mod tidy
-        run: go mod tidy
+      - name: go mod download && go mod verify
+        run: go mod download && go mod verify
       - name: Build libwgbridge.so
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./build-android.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -99,8 +99,8 @@ jobs:
           cache: false
       # TODO: replace with `go mod download && go mod verify && go mod tidy -diff`
       # once go.sum is committed.
-      - name: go mod tidy
-        run: go mod tidy
+      - name: go mod download && go mod verify
+        run: go mod download && go mod verify
       - name: Build libwgbridge.dylib
         shell: bash
         run: ./build-desktop.sh
@@ -122,9 +122,9 @@ jobs:
           cache: false
       # TODO: replace with `go mod download && go mod verify && go mod tidy -diff`
       # once go.sum is committed.
-      - name: go mod tidy
+      - name: go mod download && go mod verify
         shell: bash
-        run: go mod tidy
+        run: go mod download && go mod verify
       - name: Build wgbridge.dll
         shell: bash
         run: ./build-desktop.sh
