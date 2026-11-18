@@ -3,12 +3,17 @@ package org.terminalmax.core.sync
 
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.net.InetAddress
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.Credentials
+import okhttp3.Dns
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -24,13 +29,18 @@ import okhttp3.ResponseBody
  * Security properties:
  *  - HTTPS is required unless the host is `localhost`, `127.0.0.1` or `::1`, or [allowInsecureHttp] is set; the
  *    constructor throws otherwise, so credentials can never be sent in clear text to a remote host by accident.
- *  - Basic auth is sent preemptively on every request (only ever to the configured origin).
+ *    The name `localhost` is always resolved to the IPv4 loopback address, never through the system resolver.
+ *  - Basic auth is sent preemptively on every request (only ever to the configured origin). The credentials live
+ *    for the lifetime of this object in an immutable `String` inside the `Authorization` header value; only the
+ *    array passed to the constructor is left untouched.
  *  - Redirects are never followed automatically. Same-origin (scheme, host, port) 307/308 redirects (and
  *    301/302/303 for GET) are followed manually up to 3 times; any redirect to another origin fails the request
  *    before a single byte (or credential) is sent there.
- *  - Only strong, quoted ETags are ever used in `If-Match`.
- *  - Response bodies are capped at [maxResponseBytes] (32 MiB by default); PROPFIND responses at 1 MiB.
- *  - PROPFIND responses are scanned by [PropfindParser], which cannot be made to resolve entities.
+ *  - Only strong, quoted, header-safe ETags are ever used in `If-Match` (see [isStrongEtag]). Header values that
+ *    OkHttp refuses to send turn into a [RemoteIoException]; nothing else escapes.
+ *  - Response bodies are capped at [maxResponseBytes] (8 MiB by default) for GET and at 64 KiB for PROPFIND;
+ *    bodies of PUT, DELETE and MKCOL responses are not read at all.
+ *  - PROPFIND responses are scanned by [PropfindParser], which is linear-time and cannot be made to resolve entities.
  *
  * @param baseUrl URL of the WebDAV collection that holds the files (a trailing slash is added if missing)
  * @param password is copied into the Authorization header; the array is neither modified nor retained
@@ -38,7 +48,7 @@ import okhttp3.ResponseBody
  */
 class WebDavStore(
     baseUrl: String,
-    username: String,
+    private val username: String,
     password: CharArray,
     private val fileName: String = DEFAULT_FILE_NAME,
     httpClient: OkHttpClient = defaultHttpClient(),
@@ -51,11 +61,15 @@ class WebDavStore(
     private val fileUrl: HttpUrl
     private val lockUrl: HttpUrl
     private val authorization: String
-    private val client: OkHttpClient = httpClient.newBuilder()
-        .followRedirects(false)
-        .followSslRedirects(false)
-        .build()
+    private val client: OkHttpClient
     private val random = SecureRandom()
+
+    @Volatile
+    private var serverDate: Long? = null
+
+    override val serverKey: String
+
+    override val lastServerDateMillis: Long? get() = serverDate
 
     init {
         require(NAME_PATTERN.matches(fileName) && NAME_PATTERN.matches(lockFileName)) { "Invalid file name" }
@@ -70,6 +84,20 @@ class WebDavStore(
         fileUrl = collection.newBuilder().addPathSegment(fileName).build()
         lockUrl = collection.newBuilder().addPathSegment(lockFileName).build()
         authorization = Credentials.basic(username, String(password), StandardCharsets.UTF_8)
+        serverKey = "$collection|$username"
+        val systemDns = httpClient.dns
+        client = httpClient.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .dns(object : Dns {
+                override fun lookup(hostname: String): List<InetAddress> =
+                    if (hostname.equals("localhost", ignoreCase = true)) {
+                        listOf(InetAddress.getByAddress("localhost", byteArrayOf(127, 0, 0, 1)))
+                    } else {
+                        systemDns.lookup(hostname)
+                    }
+            })
+            .build()
     }
 
     // ------------------------------------------------------------------ RemoteStore
@@ -83,13 +111,11 @@ class WebDavStore(
 
     override suspend fun readLock(): RemoteFile? = withContext(Dispatchers.IO) { getFile(lockUrl) }
 
-    override suspend fun writeLock(bytes: ByteArray, ifNoneMatch: Boolean): WriteResult =
-        withContext(Dispatchers.IO) { putFile(lockUrl, bytes, null, ifNoneMatch) }
+    override suspend fun writeLock(bytes: ByteArray, ifMatchEtag: String?, ifNoneMatch: Boolean): WriteResult =
+        withContext(Dispatchers.IO) { putFile(lockUrl, bytes, ifMatchEtag, ifNoneMatch) }
 
-    override suspend fun deleteLock(): Boolean = withContext(Dispatchers.IO) {
-        val reply = send("DELETE", lockUrl)
-        reply.code in 200..299 || reply.code == 404
-    }
+    override suspend fun deleteLock(ifMatchEtag: String?): DeleteResult =
+        withContext(Dispatchers.IO) { deleteFile(lockUrl, ifMatchEtag) }
 
     // ------------------------------------------------------------------ operations
 
@@ -123,6 +149,17 @@ class WebDavStore(
         }
     }
 
+    private fun deleteFile(url: HttpUrl, ifMatchEtag: String?): DeleteResult {
+        if (ifMatchEtag != null && !isStrongEtag(ifMatchEtag)) return DeleteResult.Failed
+        val headers = if (ifMatchEtag != null) mapOf("If-Match" to ifMatchEtag) else emptyMap()
+        val reply = send("DELETE", url, headers)
+        return when {
+            reply.code in 200..299 || reply.code == 404 -> DeleteResult.Deleted
+            reply.code == 412 -> DeleteResult.PreconditionFailed
+            else -> DeleteResult.Failed
+        }
+    }
+
     /** MKCOL on the collection; "already exists" (405) and most other answers are fine. */
     private fun ensureCollection() {
         try {
@@ -134,27 +171,49 @@ class WebDavStore(
         }
     }
 
-    /** ETag via PROPFIND (Depth 0), or null when unavailable or the XML was rejected. */
-    private fun propfindEtag(url: HttpUrl): String? {
-        val reply = try {
-            send("PROPFIND", url, mapOf("Depth" to "0"), PROPFIND_BODY.toByteArray(), "application/xml", PROPFIND_LIMIT)
+    /**
+     * Deletes `terminalmax.probe-*` scratch files left behind by a probe that died half-way (listing the collection
+     * with PROPFIND Depth 1). Best effort; only names of exactly the scratch-file shape are ever touched.
+     */
+    private fun sweepStaleProbeFiles() {
+        try {
+            val reply = send("PROPFIND", collection, mapOf("Depth" to "1"), PROPFIND_BODY.toByteArray(), "application/xml")
+            if (reply.code !in 200..299) return
+            val hrefs = try {
+                PropfindParser.extractHrefs(reply.bytes.decodeToString())
+            } catch (e: XmlRejectedException) {
+                return
+            }
+            var deleted = 0
+            for (href in hrefs) {
+                if (deleted >= MAX_SWEPT_FILES) break
+                val name = href.trimEnd('/').substringAfterLast('/')
+                if (!PROBE_NAME_PATTERN.matches(name)) continue
+                deleted++
+                try {
+                    send("DELETE", collection.newBuilder().addPathSegment(name).build())
+                } catch (e: RemoteAuthException) {
+                    throw e
+                } catch (e: RemoteIoException) {
+                    // Best effort.
+                }
+            }
         } catch (e: RemoteAuthException) {
             throw e
         } catch (e: RemoteIoException) {
-            return null
-        }
-        if (reply.code !in 200..299) return null
-        return try {
-            PropfindParser.extractEtag(reply.bytes.decodeToString())
-        } catch (e: XmlRejectedException) {
-            null
+            // Listing is optional.
         }
     }
 
-    private fun currentEtag(url: HttpUrl): String? = propfindEtag(url) ?: getFile(url)?.etag
-
+    /**
+     * Measures what the server does with a scratch file, using the same ETag source the engine uses (the `ETag`
+     * header of GET responses): a bogus `If-Match` must be rejected, the *correct* one must be accepted, create-only
+     * writes must protect an existing file, the ETag must change with same-size content, and a conditional DELETE
+     * must be honoured.
+     */
     private fun runProbe(): ServerCapabilities {
         ensureCollection()
+        sweepStaleProbeFiles()
         val scratch = collection.newBuilder().addPathSegment("terminalmax.probe-" + randomHex(8)).build()
         try {
             val first = randomBytes(24)
@@ -162,44 +221,63 @@ class WebDavStore(
             if (created !is WriteResult.Written) throw RemoteIoException("Probe could not create a scratch file")
             var current = first
             var everyPutHadEtag = created.etag != null
-
             val strongObserved = ArrayList<Boolean>()
-            val etag0 = currentEtag(scratch)
-            strongObserved += isStrongEtag(etag0)
+
+            val initial = getFile(scratch) ?: throw RemoteIoException("Probe file vanished")
+            strongObserved += isStrongEtag(initial.etag)
 
             // (1) A bogus If-Match must be rejected with 412 and leave the content unchanged.
             val bogus = "\"tmx-bogus-" + randomHex(6) + "\""
-            val ifMatchAttempt = randomBytes(24)
-            val r1 = putFile(scratch, ifMatchAttempt, bogus, false)
-            var after = getFile(scratch)?.bytes
-            val honoursIfMatch = r1 is WriteResult.PreconditionFailed && after != null && after.contentEquals(current)
-            if (after != null) current = after
+            val r1 = putFile(scratch, randomBytes(24), bogus, false)
+            var after = getFile(scratch)
+            val honoursIfMatch = r1 is WriteResult.PreconditionFailed && after != null && after.bytes.contentEquals(current)
+            if (after != null) current = after.bytes
 
-            // (2) If-None-Match: * on an existing file must not overwrite it.
-            val ifNoneMatchAttempt = randomBytes(24)
-            val r2 = putFile(scratch, ifNoneMatchAttempt, null, true)
-            after = getFile(scratch)?.bytes
-            val honoursIfNoneMatch = r2 is WriteResult.PreconditionFailed && after != null && after.contentEquals(current)
-            if (after != null) current = after
+            // (2) The ETag the server just handed out must be accepted and the new content applied.
+            var acceptsMatching = false
+            val goodEtag = usableEtag(after?.etag)
+            if (goodEtag != null) {
+                val next = randomBytes(24)
+                val r = putFile(scratch, next, goodEtag, false)
+                after = getFile(scratch)
+                acceptsMatching = r is WriteResult.Written && after != null && after.bytes.contentEquals(next)
+                if (r is WriteResult.Written && r.etag == null) everyPutHadEtag = false
+                if (after != null) {
+                    current = after.bytes
+                    strongObserved += isStrongEtag(after.etag)
+                }
+            }
 
-            // (3) The ETag must change when same-size content is replaced. Two consecutive replacements are
+            // (3) If-None-Match: * on an existing file must not overwrite it.
+            val r3 = putFile(scratch, randomBytes(24), null, true)
+            after = getFile(scratch)
+            val honoursIfNoneMatch = r3 is WriteResult.PreconditionFailed && after != null && after.bytes.contentEquals(current)
+            if (after != null) current = after.bytes
+
+            // (4) The ETag must change when same-size content is replaced. Two consecutive replacements are
             // compared so a timestamp-resolution boundary cannot make a weak scheme look good.
             var etagChanges = true
-            var previousEtag = currentEtag(scratch)
+            var previousEtag = after?.etag
             repeat(2) {
                 val next = randomBytes(24)
                 val r = putFile(scratch, next, null, false)
                 if (r !is WriteResult.Written) throw RemoteIoException("Probe could not update the scratch file")
                 if (r.etag == null) everyPutHadEtag = false
-                val updated = currentEtag(scratch)
+                val updated = getFile(scratch)?.etag
                 strongObserved += isStrongEtag(updated)
                 if (previousEtag == null || updated == null || previousEtag == updated) etagChanges = false
                 previousEtag = updated
             }
 
+            // (5) A DELETE with a bogus If-Match must be rejected and delete nothing.
+            val d = deleteFile(scratch, bogus)
+            val honoursDeleteIfMatch = d == DeleteResult.PreconditionFailed && getFile(scratch) != null
+
             return ServerCapabilities(
                 honoursIfMatch = honoursIfMatch,
+                acceptsMatchingIfMatch = acceptsMatching,
                 honoursIfNoneMatchStar = honoursIfNoneMatch,
+                honoursIfMatchOnDelete = honoursDeleteIfMatch,
                 etagChangesOnPut = etagChanges,
                 putReturnsEtag = everyPutHadEtag,
                 strongEtags = strongObserved.all { it },
@@ -219,7 +297,8 @@ class WebDavStore(
 
     /**
      * One request with manual, same-origin-only redirect handling. Authorization is attached only to URLs on the
-     * configured origin, and redirects are validated before they are followed.
+     * configured origin, and redirects are validated before they are followed. Throws [RemoteIoException] (or its
+     * subclass [RemoteAuthException]) for every failure, including header values OkHttp refuses to send.
      */
     private fun send(
         method: String,
@@ -227,18 +306,27 @@ class WebDavStore(
         headers: Map<String, String> = emptyMap(),
         body: ByteArray? = null,
         contentType: String? = null,
-        limit: Int = maxResponseBytes,
     ): Reply {
+        val limit = when (method) {
+            "GET" -> maxResponseBytes
+            "PROPFIND" -> PROPFIND_LIMIT
+            else -> 0
+        }
         var target = url
         var redirects = 0
         while (true) {
-            check(sameOrigin(target)) { "Request target is not on the configured origin" }
+            if (!sameOrigin(target)) throw RemoteIoException("Request target is not on the configured origin")
             val requestBody: RequestBody? = body?.toRequestBody(contentType?.toMediaType())
-            val builder = Request.Builder().url(target).header("Authorization", authorization)
-            for ((k, v) in headers) builder.header(k, v)
-            val request = builder.method(method, requestBody).build()
+            val request = try {
+                val builder = Request.Builder().url(target).header("Authorization", authorization)
+                for ((k, v) in headers) builder.header(k, v)
+                builder.method(method, requestBody).build()
+            } catch (e: IllegalArgumentException) {
+                throw RemoteIoException("Refusing to send a malformed request header")
+            }
             try {
                 client.newCall(request).execute().use { response ->
+                    parseHttpDate(response.header("Date"))?.let { serverDate = it }
                     val code = response.code
                     if (code in REDIRECT_CODES) {
                         val location = response.header("Location")
@@ -255,10 +343,13 @@ class WebDavStore(
                         return@use null
                     }
                     if (code == 401 || code == 403) throw RemoteAuthException("Server rejected the credentials (HTTP $code)")
-                    return Reply(code, response.header("ETag"), readCapped(response.body, limit))
+                    val bytes = if (limit > 0) readCapped(response.body, limit) else ByteArray(0)
+                    return Reply(code, response.header("ETag"), bytes)
                 }
             } catch (e: IOException) {
                 throw RemoteIoException("Network error (${e.javaClass.simpleName})", e)
+            } catch (e: RuntimeException) {
+                throw RemoteIoException("Unexpected client error (${e.javaClass.simpleName})", e)
             }
         }
     }
@@ -292,11 +383,13 @@ class WebDavStore(
     companion object {
         const val DEFAULT_FILE_NAME = "terminalmax.vault"
         const val DEFAULT_LOCK_FILE_NAME = "terminalmax.lock"
-        const val MAX_RESPONSE_BYTES = 32 * 1024 * 1024
-        private const val PROPFIND_LIMIT = 1024 * 1024
+        const val MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+        private const val PROPFIND_LIMIT = 64 * 1024
         private const val MAX_REDIRECTS = 3
+        private const val MAX_SWEPT_FILES = 8
         private val REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
-        private val NAME_PATTERN = Regex("[A-Za-z0-9._-]{1,128}")
+        private val NAME_PATTERN = Regex("(?!\\.{1,2}$)[A-Za-z0-9._-]{1,128}")
+        private val PROBE_NAME_PATTERN = Regex("terminalmax\\.probe-[0-9a-f]{16}")
         private const val PROPFIND_BODY =
             "<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><prop><getetag/></prop></propfind>"
 
@@ -313,5 +406,15 @@ class WebDavStore(
         /** Hosts for which plain HTTP is acceptable without an explicit opt-in. */
         fun isLoopbackHost(host: String): Boolean =
             host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
+
+        /** Parses an HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`) to epoch milliseconds, or null. */
+        internal fun parseHttpDate(value: String?): Long? {
+            if (value == null || value.length > 64) return null
+            return try {
+                ZonedDateTime.parse(value.trim(), DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli()
+            } catch (e: DateTimeParseException) {
+                null
+            }
+        }
     }
 }

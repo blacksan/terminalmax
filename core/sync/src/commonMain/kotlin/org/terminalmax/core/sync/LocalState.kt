@@ -1,28 +1,100 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package org.terminalmax.core.sync
 
-import org.terminalmax.core.vault.VaultContent
+/** The local sync state cannot be read, is corrupt, or cannot be written. Sync fails closed instead of resetting it. */
+class LocalStateException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
 /**
- * What a device remembers between syncs.
+ * What a device remembers about one vault between syncs. It holds no secrets: [baseFile] is the encrypted file
+ * exactly as it was last synced (the three-way merge base is decrypted from it with the data key when needed).
  *
- * @property baseContent the content as of the last successful sync (the three-way merge base)
- * @property lastEtag ETag of the remote file as of the last successful sync
- * @property highestRevisionSeen per vault id, the highest revision ever observed remotely or written by this device
+ * The "highest" values are floors: a remote file below any of them is a rollback or a replay.
+ *
+ * @property baseFile the vault file as of the last successful sync, or null
+ * @property highestRevision highest content revision ever read from or written to the remote
+ * @property highestKeyEpoch highest key epoch seen
+ * @property highestHeaderRevision highest slot-set revision seen
+ * @property fileDigests SHA-256 hex of the files seen, by content revision, newest [MAX_DIGESTS] only; a different
+ *   file at an already seen revision is a fork
  */
-data class LocalSyncState(
-    val baseContent: VaultContent? = null,
+data class VaultSyncState(
+    val baseFile: ByteArray? = null,
+    val highestRevision: Long = 0L,
+    val highestKeyEpoch: Long = 0L,
+    val highestHeaderRevision: Long = 0L,
+    val fileDigests: Map<Long, String> = emptyMap(),
+) {
+    /** True once this device has synced the vault at least once (so a missing remote file is suspicious). */
+    val established: Boolean get() = baseFile != null || highestRevision > 0L
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is VaultSyncState) return false
+        return highestRevision == other.highestRevision &&
+            highestKeyEpoch == other.highestKeyEpoch &&
+            highestHeaderRevision == other.highestHeaderRevision &&
+            fileDigests == other.fileDigests &&
+            (baseFile?.contentEquals(other.baseFile) ?: (other.baseFile == null))
+    }
+
+    override fun hashCode(): Int {
+        var result = baseFile?.contentHashCode() ?: 0
+        result = 31 * result + highestRevision.hashCode()
+        result = 31 * result + highestKeyEpoch.hashCode()
+        result = 31 * result + highestHeaderRevision.hashCode()
+        result = 31 * result + fileDigests.hashCode()
+        return result
+    }
+
+    override fun toString(): String =
+        "VaultSyncState(base=${baseFile?.size ?: 0} bytes, revision=$highestRevision, keyEpoch=$highestKeyEpoch, " +
+            "headerRevision=$highestHeaderRevision, digests=${fileDigests.size})"
+
+    companion object {
+        const val MAX_DIGESTS: Int = 64
+    }
+}
+
+/**
+ * What a device remembers about one server (see [RemoteStore.serverKey]).
+ *
+ * @property lastEtag the (usable) ETag of the vault file as of the last successful sync
+ * @property capabilities result of the last probe of this server, valid for [SyncEngine]'s re-probe interval
+ * @property probedAtEpochMs local clock time of that probe
+ */
+data class ServerSyncState(
     val lastEtag: String? = null,
-    val highestRevisionSeen: Map<String, Long> = emptyMap(),
     val capabilities: ServerCapabilities? = null,
+    val probedAtEpochMs: Long = 0L,
 )
 
-/** Persistence for [LocalSyncState]. A file-backed implementation is not part of this module yet. */
+/**
+ * @property vaults per vault id (floors and base follow the vault across servers on purpose: a vault restored on
+ *   another server must not be older than what this device has already seen)
+ * @property servers per [RemoteStore.serverKey]
+ */
+data class LocalSyncState(
+    val vaults: Map<String, VaultSyncState> = emptyMap(),
+    val servers: Map<String, ServerSyncState> = emptyMap(),
+)
+
+/**
+ * Persistence for [LocalSyncState]. Implementations must make [save] atomic (a crash leaves the old state or the
+ * new one, never a mixture) and durable, and must throw [LocalStateException] instead of returning an empty state
+ * when stored state exists but cannot be read.
+ */
 interface LocalStateStore {
     suspend fun load(): LocalSyncState
     suspend fun save(state: LocalSyncState)
+
+    /**
+     * Runs [block] while no other [SyncEngine] (in this or another process) uses the same state. The default does
+     * nothing; the file-backed store implements it with a file lock.
+     */
+    suspend fun <T> exclusive(block: suspend () -> T): T = block()
 }
 
+/** Keeps the state in memory only (tests, and callers that persist elsewhere). Rollback floors die with the process. */
 class InMemoryLocalStateStore(initial: LocalSyncState = LocalSyncState()) : LocalStateStore {
     private var state: LocalSyncState = initial
 

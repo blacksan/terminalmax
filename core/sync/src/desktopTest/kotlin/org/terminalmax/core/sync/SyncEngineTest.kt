@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package org.terminalmax.core.sync
 
+import java.io.File
+import java.nio.file.Files
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.random.Random
 import kotlin.test.AfterTest
@@ -40,16 +42,21 @@ class SyncEngineTest {
         val vault: OpenVault,
         maxAttempts: Int = 5,
         password: String = "p",
+        val state: LocalStateStore = InMemoryLocalStateStore(),
+        leaseMillis: Long = SyncEngine.DEFAULT_LEASE_MILLIS,
+        requestBudgetMillis: Long = SyncEngine.DEFAULT_REQUEST_BUDGET_MILLIS,
+        clock: () -> Long = { now },
     ) {
-        val state = InMemoryLocalStateStore()
-        val hooks = OpenVaultCodecHooks(vault)
+        val hooks = OpenVaultCodecHooks(vault).also { cleanup += it }
         val store = WebDavStore(server.baseUrl, "u", password.toCharArray())
         val engine = SyncEngine(
             store, hooks, state, id,
-            clock = { now },
+            clock = clock,
             random = Random(id.hashCode()),
             sleep = { },
             maxAttempts = maxAttempts,
+            leaseMillis = leaseMillis,
+            requestBudgetMillis = requestBudgetMillis,
         )
         var content: VaultContent = vault.content
 
@@ -64,14 +71,32 @@ class SyncEngineTest {
         }
 
         fun sync(options: SyncOptions = SyncOptions()): SyncOutcome = syncResult(options).outcome
+
+        /** The newest header this device would upload (after slot changes and adopted remote headers). */
+        fun currentVault(): OpenVault = hooks.currentVault()
     }
 
     private fun records(c: VaultContent) = c.records.associateBy { it.id }
 
-    private fun remoteContent(s: FakeDavServer): VaultContent {
-        val opened = VaultCodec.open(s.files.getValue(FakeDavServer.VAULT), "pw".toCharArray())
+    private fun remoteContent(s: FakeDavServer, password: String = "pw"): VaultContent {
+        val opened = VaultCodec.open(s.files.getValue(FakeDavServer.VAULT), password.toCharArray())
         return opened.content
     }
+
+    private fun openRemote(s: FakeDavServer, password: String = "pw"): OpenVault =
+        VaultCodec.open(s.files.getValue(FakeDavServer.VAULT), password.toCharArray())
+
+    private fun realNow() = System.currentTimeMillis()
+
+    private fun tempDir(): File {
+        val dir = Files.createTempDirectory("tmx-sync-test").toFile()
+        cleanup += AutoCloseable { dir.deleteRecursively() }
+        return dir
+    }
+
+    private fun vaultFile(s: FakeDavServer) = s.files.getValue(FakeDavServer.VAULT).copyOf()
+
+    private fun failure(outcome: SyncOutcome): FailureReason = (outcome as SyncOutcome.Failed).reason
 
     private fun newVault(): OpenVault = VaultCodec.create("pw".toCharArray(), fast)
 
@@ -98,9 +123,11 @@ class SyncEngineTest {
         assertTrue(s.requests("PUT", FakeDavServer.VAULT).single().ifNoneMatch == "*")
         runBlocking {
             val st = a.state.load()
-            assertEquals(a.content, st.baseContent)
-            assertEquals(a.content.revision, st.highestRevisionSeen[a.content.vaultId])
-            assertNotNull(st.capabilities)
+            val vaultState = assertNotNull(st.vaults[a.content.vaultId])
+            assertNotNull(vaultState.baseFile)
+            assertEquals(a.content.revision, vaultState.highestRevision)
+            assertEquals(1L, vaultState.highestKeyEpoch)
+            assertNotNull(st.servers[a.store.serverKey]?.capabilities)
         }
     }
 
@@ -247,7 +274,7 @@ class SyncEngineTest {
         val s = server()
         val (a, b) = twoDevices(s)
         b.edit { it.upsertHost(host("from B"), id = "b1") }
-        val bytesFromB = b.hooks.encrypt(b.content, s.files[FakeDavServer.VAULT])
+        val bytesFromB = b.hooks.encrypt(b.content, s.files[FakeDavServer.VAULT]).bytes
         // B's upload lands after A has read the file but before A's PUT is evaluated.
         s.beforeNextPut = { s.files[FakeDavServer.VAULT] = bytesFromB }
 
@@ -265,7 +292,7 @@ class SyncEngineTest {
         val s = server()
         val (a, b) = twoDevices(s)
         b.edit { it.upsertHost(host("from B"), id = "b1") }
-        val bytesFromB = b.hooks.encrypt(b.content, s.files[FakeDavServer.VAULT])
+        val bytesFromB = b.hooks.encrypt(b.content, s.files[FakeDavServer.VAULT]).bytes
         s.afterPutBeforeNextGet = { s.files[FakeDavServer.VAULT] = bytesFromB }
 
         a.edit { it.upsertHost(host("from A"), id = "a1") }
@@ -285,7 +312,7 @@ class SyncEngineTest {
         val a = Device("A2", s, VaultCodec.open(s.files.getValue(FakeDavServer.VAULT), "pw".toCharArray()), maxAttempts = 5)
         a.sync()
         b.edit { it.upsertHost(host("from B"), id = "b1") }
-        val bytesFromB = b.hooks.encrypt(b.content, s.files[FakeDavServer.VAULT])
+        val bytesFromB = b.hooks.encrypt(b.content, s.files[FakeDavServer.VAULT]).bytes
         lateinit var arm: () -> Unit
         arm = {
             s.afterPutBeforeNextGet = {
@@ -304,36 +331,54 @@ class SyncEngineTest {
 
     // ------------------------------------------------------------------ lock lease
 
+    /** Ignores preconditions, so every upload goes through the lock file with unconditional lock operations. */
     private fun lockedServer() = server(Config(honourIfMatch = false, honourIfNoneMatch = false))
 
-    private fun seedLock(s: FakeDavServer, expiresAt: Long, deviceId: String = "someone-else") {
-        s.files[FakeDavServer.LOCK] = LockFile.encode(LockInfo(deviceId, "tok", expiresAt))
+    private fun seedLock(s: FakeDavServer, expiresAt: Long, deviceId: String = "someone-else", token: String = "tok") {
+        s.files[FakeDavServer.LOCK] = LockFile.encode(LockInfo(deviceId, token, expiresAt))
     }
+
+    private fun lockToken(s: FakeDavServer): String? = s.files[FakeDavServer.LOCK]?.let { LockFile.decode(it)?.token }
 
     @Test
     fun liveLockHeldByAnotherDeviceBlocksTheSync() {
         val s = lockedServer()
-        seedLock(s, expiresAt = now + 30_000)
+        seedLock(s, expiresAt = realNow() + 30_000)
         val a = Device("A", s, newVault())
         a.edit { it.upsertHost(host("one"), id = "h1") }
-        val outcome = a.sync()
-        assertEquals(FailureReason.Locked, (outcome as SyncOutcome.Failed).reason)
+        assertEquals(FailureReason.Locked, failure(a.sync()))
         assertFalse(s.files.containsKey(FakeDavServer.VAULT))
-        assertTrue(s.files.containsKey(FakeDavServer.LOCK), "someone else's lock must be left alone")
+        assertEquals("tok", lockToken(s), "someone else's lock must be left alone")
     }
 
     @Test
-    fun expiredLockIsOnlyBrokenAfterTwiceTheLease() {
+    fun anExpiredLockIsOnlyBrokenAfterTheGracePeriod() {
         val s = lockedServer()
         val a = Device("A", s, newVault())
         a.edit { it.upsertHost(host("one"), id = "h1") }
 
-        seedLock(s, expiresAt = now - 1) // expired, but younger than 2x lease
-        assertEquals(FailureReason.Locked, (a.sync() as SyncOutcome.Failed).reason)
+        seedLock(s, expiresAt = realNow() - 5_000) // expired, but inside the 30 s grace
+        assertEquals(FailureReason.Locked, failure(a.sync()))
+        assertEquals("tok", lockToken(s))
 
-        seedLock(s, expiresAt = now - 60_001) // older than 2x lease: stale
+        seedLock(s, expiresAt = realNow() - 40_000) // expired and past the grace: takeover
         assertEquals(SyncOutcome.Pushed, a.sync())
         assertFalse(s.files.containsKey(FakeDavServer.LOCK))
+    }
+
+    @Test
+    fun lockJudgementUsesTheServerClockSoDeviceClockSkewDoesNotMatter() {
+        val s = lockedServer()
+        // A device whose clock runs a day ahead must still respect a live lock ...
+        val ahead = Device("A", s, newVault(), clock = { realNow() + 86_400_000L })
+        ahead.edit { it.upsertHost(host("one"), id = "h1") }
+        seedLock(s, expiresAt = realNow() + 30_000)
+        assertEquals(FailureReason.Locked, failure(ahead.sync()))
+        // ... and a device whose clock runs a day behind must still take over a long dead one.
+        val behind = Device("B", s, newVault(), clock = { realNow() - 86_400_000L })
+        behind.edit { it.upsertHost(host("two"), id = "h2") }
+        seedLock(s, expiresAt = realNow() - 60_000)
+        assertEquals(SyncOutcome.Pushed, behind.sync())
     }
 
     @Test
@@ -341,39 +386,271 @@ class SyncEngineTest {
         val s = lockedServer()
         val a = Device("A", s, newVault())
         a.edit { it.upsertHost(host("one"), id = "h1") }
-        seedLock(s, expiresAt = now + 30_000, deviceId = "A")
+        seedLock(s, expiresAt = realNow() + 30_000, deviceId = "A")
         assertEquals(SyncOutcome.Pushed, a.sync())
         s.files[FakeDavServer.LOCK] = "not json".toByteArray()
         a.edit { it.upsertHost(host("two"), id = "h2") }
         assertEquals(SyncOutcome.Pushed, a.sync())
     }
 
-    // ------------------------------------------------------------------ rollback and integrity
+    @Test
+    fun aLockCreatedByAnotherDeviceDuringOurAttemptWinsAndWeDoNotProceed() {
+        // Weak-length ETags force the lock path while If-None-Match still makes lock creation atomic.
+        val s = server(Config(etagOverride = "\"" + "a".repeat(300) + "\""))
+        val a = Device("A", s, newVault())
+        a.edit { it.upsertHost(host("one"), id = "h1") }
+        s.beforeRequest = { method, name ->
+            if (method == "PUT" && name == FakeDavServer.LOCK) {
+                s.beforeRequest = null
+                seedLock(s, expiresAt = realNow() + 60_000, deviceId = "B", token = "b-token")
+            }
+        }
+        assertEquals(FailureReason.Locked, failure(a.sync()))
+        assertFalse(s.files.containsKey(FakeDavServer.VAULT), "the loser of the lock race must not write")
+        assertEquals("b-token", lockToken(s))
+    }
 
     @Test
-    fun rollbackIsDetectedUnlessExplicitlyOverridden() {
+    fun aLockTakenOverDuringOurUploadIsNeverDeletedOnRelease() {
+        val s = lockedServer()
+        val a = Device("A", s, newVault())
+        a.edit { it.upsertHost(host("one"), id = "h1") }
+        s.beforeRequest = { method, name ->
+            if (method == "PUT" && name == FakeDavServer.VAULT) {
+                s.beforeRequest = null
+                seedLock(s, expiresAt = realNow() + 60_000, deviceId = "B", token = "b-token")
+            }
+        }
+        a.sync()
+        assertEquals("b-token", lockToken(s), "another device's live lock must survive our release")
+    }
+
+    @Test
+    fun aStaleLockIsDeletedConditionallyAndALockReplacedMeanwhileSurvives() {
+        // Only If-None-Match is ignored: the lock can be replaced and deleted conditionally on its ETag.
+        val s = server(Config(honourIfNoneMatch = false))
+        val a = Device("A", s, newVault())
+        a.edit { it.upsertHost(host("one"), id = "h1") }
+        seedLock(s, expiresAt = realNow() - 60_000, token = "stale")
+        s.beforeRequest = { method, name ->
+            if (method == "DELETE" && name == FakeDavServer.LOCK) {
+                s.beforeRequest = null
+                // Another device breaks the same stale lock first and installs its own live one.
+                seedLock(s, expiresAt = realNow() + 60_000, deviceId = "B", token = "live")
+            }
+        }
+        assertEquals(FailureReason.Locked, failure(a.sync()))
+        assertEquals("live", lockToken(s))
+        assertTrue(s.requests("DELETE", FakeDavServer.LOCK).first().ifMatch != null, "the delete must be conditional")
+        assertFalse(s.files.containsKey(FakeDavServer.VAULT))
+    }
+
+    @Test
+    fun theLeaseIsRenewedBeforeTheUploadWhenLittleOfItRemains() {
+        val s = lockedServer()
+        val a = Device("A", s, newVault(), leaseMillis = 1_000, requestBudgetMillis = 5_000)
+        a.edit { it.upsertHost(host("one"), id = "h1") }
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        // The vault already exists on the first sync, so renewal only happens on an update.
+        a.edit { it.upsertHost(host("two"), id = "h2") }
+        val before = s.requests("PUT", FakeDavServer.LOCK).size
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        assertTrue(s.requests("PUT", FakeDavServer.LOCK).size - before >= 2, "expected acquire plus renew")
+        assertFalse(s.files.containsKey(FakeDavServer.LOCK))
+    }
+
+    // ------------------------------------------------------------------ rollback, replay and integrity
+
+    @Test
+    fun anOldRemoteFileReplayedAfterALocalEditIsRefusedAndNeverRevertsTheEdit() {
+        val s = server()
+        val (a, _) = twoDevices(s)
+        val old = vaultFile(s)
+        val oldRevision = records(a.content).getValue("h1").revision
+        a.edit { it.upsertHost(host("edited"), id = "h1") }
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        val editedRevision = records(a.content).getValue("h1").revision
+        assertTrue(editedRevision > oldRevision)
+
+        s.files[FakeDavServer.VAULT] = old // the server replays the pre-edit file
+        val refused = a.syncResult()
+        assertEquals(FailureReason.RollbackDetected, failure(refused.outcome))
+        assertTrue(old.contentEquals(s.files.getValue(FakeDavServer.VAULT)), "a refused sync must not write")
+        assertEquals(editedRevision, records(a.content).getValue("h1").revision)
+
+        // Even with the explicit override the edit survives, and the replay is reported as a regression.
+        val healed = a.syncResult(SyncOptions(allowRollback = true))
+        assertFalse(healed.outcome is SyncOutcome.Failed, "override must be honoured: ${healed.outcome}")
+        val stale = healed.warnings.filterIsInstance<SyncWarning.StaleRemoteIgnored>().single()
+        assertTrue("h1" in stale.recordIds)
+        assertEquals(editedRevision, records(remoteContent(s)).getValue("h1").revision)
+        assertEquals(editedRevision, records(a.content).getValue("h1").revision)
+    }
+
+    @Test
+    fun aServerServingAPreEditFileToASecondDeviceCannotRevertItsEdit() {
+        val s = server()
+        val (a, b) = twoDevices(s)
+        val preEdit = vaultFile(s)
+        a.edit { it.upsertHost(host("A's edit"), id = "h1") }
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        assertEquals(SyncOutcome.Pulled, b.sync())
+        b.edit { it.upsertHost(host("B's edit"), id = "h1") }
+        val bRevision = records(b.content).getValue("h1").revision
+
+        s.files[FakeDavServer.VAULT] = preEdit
+        assertEquals(FailureReason.RollbackDetected, failure(b.sync()))
+        val result = b.syncResult(SyncOptions(allowRollback = true))
+        assertEquals(SyncOutcome.Pushed, result.outcome)
+        assertTrue(result.warnings.any { it is SyncWarning.StaleRemoteIgnored && "h1" in it.recordIds })
+        assertEquals(bRevision, records(remoteContent(s)).getValue("h1").revision)
+        assertEquals(bRevision, records(b.content).getValue("h1").revision)
+    }
+
+    @Test
+    fun rollbackIsStillDetectedAfterARestartWhenTheFileStoreIsUsed() {
+        val dir = tempDir()
+        val s = server()
+        val a = Device("A", s, newVault(), state = FileLocalStateStore(dir))
+        a.edit { it.upsertHost(host("one"), id = "h1") }
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        val old = vaultFile(s)
+        a.edit { it.upsertHost(host("two"), id = "h2") }
+        assertEquals(SyncOutcome.Pushed, a.sync())
+
+        // "Restart": a new engine, a new store object on the same directory, the app's own copy of the content.
+        val restarted = Device("A", s, openRemote(s), state = FileLocalStateStore(dir))
+        restarted.content = a.content
+        s.files[FakeDavServer.VAULT] = old
+        assertEquals(FailureReason.RollbackDetected, failure(restarted.sync()))
+        assertTrue(old.contentEquals(s.files.getValue(FakeDavServer.VAULT)))
+
+        // Control: a device without persistent state has no memory of what it saw and accepts the old file.
+        val amnesiac = Device("A", s, VaultCodec.open(old, "pw".toCharArray()))
+        amnesiac.content = a.content
+        assertFalse(amnesiac.sync() is SyncOutcome.Failed)
+    }
+
+    @Test
+    fun twoDifferentFilesAtTheSameRevisionAreReportedAsAFork() {
+        val s = server()
+        val (a, b) = twoDevices(s)
+        a.edit { it.upsertHost(host("from A"), id = "a1") }
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        val revision = a.content.revision
+        b.edit { it.upsertHost(host("from B"), id = "b1") }
+        assertEquals(revision, b.content.revision, "both devices wrote the same revision")
+        s.files[FakeDavServer.VAULT] = b.hooks.encrypt(b.content, null).bytes // a different file, same revision
+
+        val result = a.syncResult()
+        assertFalse(result.outcome is SyncOutcome.Failed, "${result.outcome}")
+        assertTrue(result.warnings.any { it is SyncWarning.ForkSuspected && it.revision == revision })
+        assertEquals(setOf("h1", "a1", "b1"), records(a.content).keys) // nothing lost
+    }
+
+    @Test
+    fun aRemoteFileThatVanishedIsNotSilentlyRecreatedAndNeverBelowTheFloor() {
+        val s = server()
+        val (a, _) = twoDevices(s)
+        a.edit { it.upsertHost(host("two"), id = "h2") }
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        val floor = a.content.revision
+        s.files.remove(FakeDavServer.VAULT)
+
+        val missing = a.syncResult()
+        assertEquals(FailureReason.RemoteMissing, failure(missing.outcome))
+        assertFalse(s.files.containsKey(FakeDavServer.VAULT), "nothing may be uploaded without the explicit option")
+
+        val recreated = a.syncResult(SyncOptions(recreateRemote = true))
+        assertEquals(SyncOutcome.Pushed, recreated.outcome)
+        assertTrue(recreated.warnings.any { it is SyncWarning.RemoteRecreated })
+        assertTrue(remoteContent(s).revision > floor, "the recreated file must be above the floor")
+        assertEquals(setOf("h1", "h2"), records(remoteContent(s)).keys)
+    }
+
+    @Test
+    fun aReplayedOldKeySlotHeaderIsRejectedAndNotUploadedAgain() {
+        val s = server()
+        val (a, b) = twoDevices(s)
+        val old = vaultFile(s) // header revision 1
+        val pair = VaultCodec.generateDeviceKeyPair()
+        a.hooks.replaceVault(VaultCodec.addDeviceSlot(a.currentVault(), pair.publicKey))
+        assertEquals(SyncOutcome.Pushed, a.sync(), "a slot change must be published even without content changes")
+        assertEquals(2L, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).headerRevision)
+        b.sync() // B learns header revision 2
+
+        s.files[FakeDavServer.VAULT] = old
+        val puts = s.requests("PUT", FakeDavServer.VAULT).size
+        val outcome = b.sync(SyncOptions(allowRollback = true)) // the override never waives the header floor
+        assertEquals(FailureReason.RollbackDetected, failure(outcome))
+        assertEquals(puts, s.requests("PUT", FakeDavServer.VAULT).size)
+        assertTrue(old.contentEquals(s.files.getValue(FakeDavServer.VAULT)))
+    }
+
+    @Test
+    fun aKeyRotationIsPublishedOtherDevicesMustReopenAndAnOldEpochIsNeverUploadedAgain() {
+        val s = server()
+        val (a, b) = twoDevices(s)
+        val old = vaultFile(s) // epoch 1
+        a.hooks.replaceVault(VaultCodec.changePassword(a.currentVault(), "new".toCharArray()))
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        assertEquals(2L, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).keyEpoch)
+        assertEquals(setOf("h1"), records(remoteContent(s, "new")).keys)
+
+        // B still holds the epoch 1 key: it must be told to re-open the vault, and it writes nothing.
+        val puts = s.requests("PUT", FakeDavServer.VAULT).size
+        assertEquals(FailureReason.ReopenRequired, failure(b.sync()))
+        assertEquals(puts, s.requests("PUT", FakeDavServer.VAULT).size)
+
+        // A can keep syncing; a replayed epoch 1 file is a rollback and is not written over.
+        assertEquals(SyncOutcome.UpToDate, a.sync())
+        s.files[FakeDavServer.VAULT] = old
+        assertEquals(FailureReason.RollbackDetected, failure(a.sync(SyncOptions(allowRollback = true))))
+        assertTrue(old.contentEquals(s.files.getValue(FakeDavServer.VAULT)))
+    }
+
+    @Test
+    fun theFirstSyncOfAnExistingRemoteIsReportedAsTrustOnFirstUse() {
         val s = server()
         val a = Device("A", s, newVault())
         a.edit { it.upsertHost(host("one"), id = "h1") }
-        a.sync()
-        val oldFile = s.files.getValue(FakeDavServer.VAULT).copyOf()
-        val oldRevision = remoteContent(s).revision
-        a.edit { it.upsertHost(host("two"), id = "h2") }
-        assertEquals(SyncOutcome.Pushed, a.sync())
-        assertTrue(remoteContent(s).revision > oldRevision)
+        assertTrue(a.syncResult().warnings.isEmpty(), "creating the vault is not a trust decision")
 
-        s.files[FakeDavServer.VAULT] = oldFile // malicious or buggy server serves an old snapshot
-        val outcome = a.sync()
-        assertEquals(FailureReason.RollbackDetected, (outcome as SyncOutcome.Failed).reason)
-        assertContentEqualsFile(oldFile, s) // nothing was written over it
-
-        val overridden = a.sync(SyncOptions(allowRollback = true))
-        assertFalse(overridden is SyncOutcome.Failed, "override must be honoured: $overridden")
-        assertEquals(setOf("h1", "h2"), records(remoteContent(s)).keys) // nothing local was lost
+        val b = Device("B", s, openRemote(s))
+        val first = b.syncResult()
+        assertEquals(SyncOutcome.UpToDate, first.outcome)
+        val trust = first.warnings.filterIsInstance<SyncWarning.FirstUseTrust>().single()
+        assertEquals(a.content.revision, trust.remoteRevision)
+        assertEquals(1L, trust.keyEpoch)
+        assertTrue(b.syncResult().warnings.none { it is SyncWarning.FirstUseTrust })
     }
 
-    private fun assertContentEqualsFile(expected: ByteArray, s: FakeDavServer) =
-        assertTrue(expected.contentEquals(s.files.getValue(FakeDavServer.VAULT)))
+    @Test
+    fun anUnusableEtagMakesTheEngineFallBackToTheLockInsteadOfSendingIt() {
+        val s = server(Config(etagOverride = "\"" + "a".repeat(300) + "\""))
+        val a = Device("A", s, newVault())
+        a.edit { it.upsertHost(host("one"), id = "h1") }
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        a.edit { it.upsertHost(host("two"), id = "h2") }
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        assertTrue(s.requests("PUT", FakeDavServer.VAULT).all { it.ifMatch == null })
+        assertTrue(s.requests("PUT", FakeDavServer.LOCK).isNotEmpty())
+        assertEquals(setOf("h1", "h2"), records(remoteContent(s)).keys)
+    }
+
+    @Test
+    fun unreadableLocalStateFailsClosedInsteadOfSwitchingRollbackProtectionOff() {
+        val dir = tempDir()
+        val s = server()
+        val a = Device("A", s, newVault(), state = FileLocalStateStore(dir))
+        a.edit { it.upsertHost(host("one"), id = "h1") }
+        assertEquals(SyncOutcome.Pushed, a.sync())
+        File(dir, FileLocalStateStore.DEFAULT_FILE_NAME).writeBytes(ByteArray(100) { 7 })
+
+        val restarted = Device("A", s, openRemote(s), state = FileLocalStateStore(dir))
+        restarted.content = a.content
+        assertEquals(FailureReason.LocalStateUnavailable, failure(restarted.sync()))
+    }
 
     @Test
     fun tamperedGarbageAndForeignRemoteFilesFailCleanly() {
@@ -382,14 +659,14 @@ class SyncEngineTest {
         val good = s.files.getValue(FakeDavServer.VAULT)
 
         s.files[FakeDavServer.VAULT] = good.copyOf().also { it[it.size - 1] = (it[it.size - 1].toInt() xor 1).toByte() }
-        assertEquals(FailureReason.BadPasswordOrCorrupt, (a.sync() as SyncOutcome.Failed).reason)
+        assertEquals(FailureReason.BadPasswordOrCorrupt, failure(a.sync()))
 
         s.files[FakeDavServer.VAULT] = Random(5).nextBytes(500)
         assertEquals(FailureReason.InvalidRemoteFile, (a.sync() as SyncOutcome.Failed).reason)
 
         val foreign = Device("X", server(), newVault())
         foreign.edit { it.upsertHost(host("other vault"), id = "x") }
-        s.files[FakeDavServer.VAULT] = foreign.hooks.encrypt(foreign.content, null)
+        s.files[FakeDavServer.VAULT] = foreign.hooks.encrypt(foreign.content, null).bytes
         assertEquals(FailureReason.DifferentVault, (a.sync() as SyncOutcome.Failed).reason)
 
         s.files[FakeDavServer.VAULT] = good // restoring the file lets the device continue

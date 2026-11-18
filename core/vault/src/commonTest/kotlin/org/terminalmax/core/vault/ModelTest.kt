@@ -54,7 +54,7 @@ class ModelTest {
         val editor = VaultEditor(decoded, "C")
         val host = Payloads.host(decoded.records[0].payload).copy(label = "renamed")
         val updated = editor.upsertHost(host, id = "1")
-        assertEquals(3L, updated.revision)
+        assertEquals(8L, updated.revision) // max(record 2, content 7) + 1
         assertEquals("C", updated.deviceId)
         assertEquals(JsonPrimitive("renamed"), updated.payload["label"])
         assertNotNull(updated.payload["futureField"])

@@ -41,7 +41,19 @@ class WebDavStoreTest {
     fun probeReportsAFullyCapableServerAndCleansUp() = runBlocking<Unit> {
         val s = server()
         val caps = store(s).probe()
-        assertEquals(ServerCapabilities(true, true, true, true, true), caps)
+        assertEquals(
+            ServerCapabilities(
+                honoursIfMatch = true,
+                acceptsMatchingIfMatch = true,
+                honoursIfNoneMatchStar = true,
+                honoursIfMatchOnDelete = true,
+                etagChangesOnPut = true,
+                putReturnsEtag = true,
+                strongEtags = true,
+            ),
+            caps,
+        )
+        assertTrue(caps.supportsConditionalLocks)
         assertTrue(caps.supportsConditionalWrites)
         assertTrue(noScratchFilesLeft(s), "scratch file left behind: ${s.files.keys}")
         assertTrue(s.files.isEmpty())
@@ -102,6 +114,48 @@ class WebDavStoreTest {
     }
 
     @Test
+    fun probeDetectsAServerThatRejectsEvenTheCorrectEtag() = runBlocking<Unit> {
+        val s = server(Config(rejectAllIfMatch = true))
+        val caps = store(s).probe()
+        assertTrue(caps.honoursIfMatch, "a bogus ETag is rejected, so this alone would look fine")
+        assertFalse(caps.acceptsMatchingIfMatch, "the correct ETag from GET must be accepted for the server to count")
+        assertFalse(caps.supportsConditionalWrites)
+        assertTrue(noScratchFilesLeft(s))
+    }
+
+    @Test
+    fun probeDetectsAServerThatIgnoresIfMatchOnDelete() = runBlocking<Unit> {
+        val s = server(Config(honourIfMatchOnDelete = false))
+        val caps = store(s).probe()
+        assertFalse(caps.honoursIfMatchOnDelete)
+        assertTrue(caps.supportsConditionalWrites)
+        assertFalse(caps.supportsConditionalLocks)
+        assertTrue(noScratchFilesLeft(s))
+    }
+
+    @Test
+    fun probeTreatsOverlongEtagsAsNotStrong() = runBlocking<Unit> {
+        val s = server(Config(etagOverride = "\"" + "a".repeat(300) + "\""))
+        val caps = store(s).probe()
+        assertFalse(caps.strongEtags)
+        assertFalse(caps.supportsConditionalWrites)
+    }
+
+    @Test
+    fun probeSweepsStaleScratchFilesAndOnlyThose() = runBlocking<Unit> {
+        val s = server()
+        s.files["terminalmax.probe-0123456789abcdef"] = byteArrayOf(1)
+        s.files["terminalmax.probe-short"] = byteArrayOf(2)
+        s.files["notes.txt"] = byteArrayOf(3)
+        s.files[FakeDavServer.VAULT] = byteArrayOf(4)
+        store(s).probe()
+        assertFalse(s.files.containsKey("terminalmax.probe-0123456789abcdef"))
+        assertTrue(s.files.containsKey("terminalmax.probe-short"))
+        assertTrue(s.files.containsKey("notes.txt"))
+        assertContentEquals(byteArrayOf(4), s.files[FakeDavServer.VAULT])
+    }
+
+    @Test
     fun probeNeverTouchesTheVaultFile() = runBlocking<Unit> {
         val s = server()
         s.files[FakeDavServer.VAULT] = byteArrayOf(1, 2, 3)
@@ -151,6 +205,46 @@ class WebDavStoreTest {
     }
 
     @Test
+    fun etagsThatCouldInjectHeadersOrAreNotStrongAreNeverSent() = runBlocking<Unit> {
+        val s = server()
+        val st = store(s)
+        for (bad in listOf("\"a\r\nX-Evil: 1\"", "\"\u00e9\"", "\"a\"b\"", "\"" + "a".repeat(257) + "\"", "W/\"a\"", "")) {
+            assertIs<WriteResult.Failed>(st.write(byteArrayOf(1), bad, false), "accepted: ${bad.length} chars")
+            assertEquals(DeleteResult.Failed, st.deleteLock(bad))
+        }
+        assertTrue(s.log.none { it.method == "PUT" || it.method == "DELETE" })
+    }
+
+    @Test
+    fun isStrongEtagAcceptsOnlyQuotedVisibleAsciiOfBoundedLength() {
+        assertTrue(isStrongEtag("\"abc\""))
+        assertTrue(isStrongEtag("\"" + "a".repeat(256) + "\""))
+        assertFalse(isStrongEtag("\"" + "a".repeat(257) + "\""))
+        assertFalse(isStrongEtag(null))
+        assertFalse(isStrongEtag(""))
+        assertFalse(isStrongEtag("\"\""))
+        assertFalse(isStrongEtag("abc"))
+        assertFalse(isStrongEtag("W/\"abc\""))
+        assertFalse(isStrongEtag("\"a\"b\""))
+        assertFalse(isStrongEtag("\"a b\""))
+        assertFalse(isStrongEtag("\"a\r\nb\""))
+        assertFalse(isStrongEtag("\"a\tb\""))
+        assertFalse(isStrongEtag("\"\u00e9\""))
+        assertFalse(isStrongEtag("\"\u007f\""))
+        assertEquals("\"x\"", usableEtag("\"x\""))
+        assertNull(usableEtag("W/\"x\""))
+    }
+
+    @Test
+    fun anOverlongServerEtagIsReadButIsNotUsable() = runBlocking<Unit> {
+        val s = server(Config(etagOverride = "\"" + "a".repeat(300) + "\""))
+        s.files[FakeDavServer.VAULT] = byteArrayOf(1)
+        val r = store(s).read()!!
+        assertFalse(isStrongEtag(r.etag))
+        assertNull(usableEtag(r.etag))
+    }
+
+    @Test
     fun weakEtagsAreNeverSentInIfMatch() = runBlocking<Unit> {
         val s = server()
         val st = store(s)
@@ -174,12 +268,58 @@ class WebDavStoreTest {
         val s = server()
         val st = store(s)
         assertNull(st.readLock())
-        assertIs<WriteResult.Written>(st.writeLock("lock".toByteArray(), ifNoneMatch = true))
-        assertEquals(WriteResult.PreconditionFailed, st.writeLock("again".toByteArray(), ifNoneMatch = true))
-        assertEquals("lock", String(st.readLock()!!.bytes))
-        assertTrue(st.deleteLock())
-        assertTrue(st.deleteLock()) // already gone is fine
+        assertIs<WriteResult.Written>(st.writeLock("lock".toByteArray(), ifMatchEtag = null, ifNoneMatch = true))
+        assertEquals(WriteResult.PreconditionFailed, st.writeLock("again".toByteArray(), ifMatchEtag = null, ifNoneMatch = true))
+        val read = st.readLock()!!
+        assertEquals("lock", String(read.bytes))
+        // A conditional replace with the ETag that was read succeeds, with a stale one it fails.
+        assertEquals(WriteResult.PreconditionFailed, st.writeLock("x".toByteArray(), "\"stale\"", false))
+        assertIs<WriteResult.Written>(st.writeLock("renewed".toByteArray(), read.etag, false))
+        assertEquals(DeleteResult.Deleted, st.deleteLock(null))
+        assertEquals(DeleteResult.Deleted, st.deleteLock(null)) // already gone is fine
         assertNull(st.readLock())
+    }
+
+    @Test
+    fun conditionalLockDeleteOnlyDeletesTheLockThatWasRead() = runBlocking<Unit> {
+        val s = server()
+        val st = store(s)
+        st.writeLock("one".toByteArray(), null, true)
+        val read = st.readLock()!!
+        // Somebody replaces the lock between our read and our delete.
+        s.files[FakeDavServer.LOCK] = "two".toByteArray()
+        assertEquals(DeleteResult.PreconditionFailed, st.deleteLock(read.etag))
+        assertEquals("two", String(st.readLock()!!.bytes))
+        assertEquals(DeleteResult.Deleted, st.deleteLock(st.readLock()!!.etag))
+        assertNull(st.readLock())
+    }
+
+    @Test
+    fun serverKeyBindsUrlAndAccountAndIgnoresTheTrailingSlash() {
+        val s = server()
+        val base = store(s)
+        assertEquals(base.serverKey, WebDavStore(s.baseUrl.trimEnd('/'), "u", "other".toCharArray()).serverKey)
+        assertTrue(base.serverKey != store(s, user = "someone").serverKey)
+        assertTrue(base.serverKey != WebDavStore("http://127.0.0.1:${s.port}/dav2/", "u", "p".toCharArray()).serverKey)
+        assertFalse(base.serverKey.contains("\"p\""), "the password must not be part of the key")
+    }
+
+    @Test
+    fun theServerDateIsTrackedFromResponses() = runBlocking<Unit> {
+        val s = server()
+        val st = store(s)
+        assertNull(st.lastServerDateMillis)
+        st.read()
+        val date = assertNotNull(st.lastServerDateMillis)
+        assertTrue(kotlin.math.abs(date - System.currentTimeMillis()) < 5 * 60_000L)
+    }
+
+    @Test
+    fun localhostIsReachedThroughTheLoopbackAddress() = runBlocking<Unit> {
+        val s = server()
+        val st = WebDavStore("http://localhost:${s.port}/dav/", "u", "p".toCharArray())
+        s.files[FakeDavServer.VAULT] = byteArrayOf(7)
+        assertContentEquals(byteArrayOf(7), st.read()!!.bytes)
     }
 
     @Test
@@ -242,6 +382,9 @@ class WebDavStoreTest {
     fun invalidFileNamesAreRejected() {
         assertFailsWith<IllegalArgumentException> { WebDavStore("https://e.com/", "u", "p".toCharArray(), fileName = "../x") }
         assertFailsWith<IllegalArgumentException> { WebDavStore("https://e.com/", "u", "p".toCharArray(), fileName = "a/b") }
+        assertFailsWith<IllegalArgumentException> { WebDavStore("https://e.com/", "u", "p".toCharArray(), fileName = ".") }
+        assertFailsWith<IllegalArgumentException> { WebDavStore("https://e.com/", "u", "p".toCharArray(), fileName = "..") }
+        assertFailsWith<IllegalArgumentException> { WebDavStore("https://e.com/", "u", "p".toCharArray(), lockFileName = "..") }
     }
 
     @Test
@@ -273,6 +416,30 @@ class WebDavStoreTest {
         assertFailsWith<RemoteIoException> { st.write(byteArrayOf(1), null, false) }
         assertTrue(seenBySource.isNotEmpty() && seenBySource.all { it != null })
         assertTrue(seenByTarget.isEmpty(), "redirect target was contacted: $seenByTarget")
+    }
+
+    @Test
+    fun aRedirectToTheSameHostOnAnotherPortIsRefused() = runBlocking<Unit> {
+        val seenByTarget = CopyOnWriteArrayList<String?>()
+        val target = HttpServer.create(InetSocketAddress(InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)), 0), 0)
+        target.createContext("/") { ex ->
+            seenByTarget += ex.requestHeaders.getFirst("Authorization")
+            ex.sendResponseHeaders(200, -1)
+            ex.close()
+        }
+        target.start()
+        cleanup += AutoCloseable { target.stop(0) }
+        val source = HttpServer.create(InetSocketAddress(InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)), 0), 0)
+        source.createContext("/") { ex ->
+            ex.responseHeaders.add("Location", "http://127.0.0.1:${target.address.port}/dav/terminalmax.vault")
+            ex.sendResponseHeaders(308, -1)
+            ex.close()
+        }
+        source.start()
+        cleanup += AutoCloseable { source.stop(0) }
+        val st = WebDavStore("http://127.0.0.1:${source.address.port}/dav/", "u", "p".toCharArray())
+        assertFailsWith<RemoteIoException> { st.read() }
+        assertTrue(seenByTarget.isEmpty(), "a different port is a different origin: $seenByTarget")
     }
 
     @Test
@@ -330,6 +497,54 @@ class WebDavStoreTest {
     }
 
     @Test
+    fun parserPicksTheEtagOfTheRequestedHrefFromAMultistatus() {
+        val xml = """<D:multistatus xmlns:D="DAV:">
+            <D:response><D:href>/dav/other.txt</D:href><D:propstat><D:prop><D:getetag>&quot;other&quot;</D:getetag></D:prop></D:propstat></D:response>
+            <D:response><D:href>http://h/dav/terminalmax.vault</D:href><D:propstat><D:prop><D:getetag>&quot;vault&quot;</D:getetag></D:prop></D:propstat></D:response>
+            </D:multistatus>"""
+        assertEquals("\"vault\"", PropfindParser.extractEtag(xml, forHref = "terminalmax.vault"))
+        assertEquals("\"other\"", PropfindParser.extractEtag(xml, forHref = "other.txt"))
+        assertNull(PropfindParser.extractEtag(xml, forHref = "missing"))
+        assertEquals("\"other\"", PropfindParser.extractEtag(xml)) // without a name: the first one
+        assertEquals(listOf("/dav/other.txt", "http://h/dav/terminalmax.vault"), PropfindParser.extractHrefs(xml))
+    }
+
+    @Test
+    fun hostileXmlIsScannedInLinearTime() {
+        val hostile = listOf(
+            "<D:getetag>".repeat(100_000),
+            "<".repeat(1_000_000),
+            "<a ".repeat(300_000),
+            "<D:getetag>" + "x".repeat(1_000_000),
+            "<D:response><D:href>/a</D:href>".repeat(50_000),
+            "<!--" + "-".repeat(1_000_000),
+            "&amp;".repeat(500_000),
+            "<D:getetag>" + "&#".repeat(400_000) + "</D:getetag>",
+        )
+        for (xml in hostile) {
+            val start = System.nanoTime()
+            try {
+                PropfindParser.extractEtag(xml)
+                PropfindParser.extractHrefs(xml)
+            } catch (e: XmlRejectedException) {
+                // also an acceptable answer
+            }
+            val millis = (System.nanoTime() - start) / 1_000_000
+            assertTrue(millis < 3_000, "took $millis ms for ${xml.take(16)}")
+        }
+    }
+
+    @Test
+    fun anOversizedPropfindAnswerIsRejectedWithoutBlockingTheProbe() = runBlocking<Unit> {
+        val huge = "<D:multistatus xmlns:D=\"DAV:\">" + "<D:getetag>&quot;x&quot;</D:getetag>".repeat(100_000) + "</D:multistatus>"
+        val s = server(Config(propfindOverride = huge))
+        val start = System.nanoTime()
+        val caps = store(s).probe()
+        assertTrue((System.nanoTime() - start) / 1_000_000 < 20_000)
+        assertTrue(caps.supportsConditionalWrites)
+    }
+
+    @Test
     fun serverSuppliedXxeIsNotFollowedAndProbeStillCompletes() = runBlocking<Unit> {
         val contacted = CopyOnWriteArrayList<String>()
         val victim = HttpServer.create(InetSocketAddress(InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)), 0), 0)
@@ -344,7 +559,7 @@ class WebDavStoreTest {
         val xxe = """<?xml version="1.0"?><!DOCTYPE r [<!ENTITY x SYSTEM "http://127.0.0.1:${victim.address.port}/xxe">]>
             <D:multistatus xmlns:D="DAV:"><D:getetag>&x;</D:getetag></D:multistatus>""".trimIndent()
         val s = server(Config(propfindOverride = xxe))
-        val caps = store(s).probe() // PROPFIND is rejected, the GET ETag header is used instead
+        val caps = store(s).probe() // the listing is rejected, the probe itself only uses GET ETags
         assertTrue(caps.supportsConditionalWrites)
         assertTrue(s.requests("PROPFIND").isNotEmpty())
         assertTrue(contacted.isEmpty(), "external entity was fetched: $contacted")

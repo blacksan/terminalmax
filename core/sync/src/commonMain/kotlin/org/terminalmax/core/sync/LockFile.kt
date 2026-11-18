@@ -2,19 +2,23 @@
 package org.terminalmax.core.sync
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 
-/** Content of `terminalmax.lock`: who holds the lease, a random token to verify ownership, and its expiry. */
+/**
+ * Content of `terminalmax.lock`: who holds the lease, a random token to verify ownership, and its expiry
+ * ([expiresAtEpochMs] is on the server's clock whenever the server sends a `Date` header).
+ */
 internal data class LockInfo(val deviceId: String, val token: String, val expiresAtEpochMs: Long)
 
 internal object LockFile {
     private const val MAX_BYTES = 4096
 
     fun encode(info: LockInfo): ByteArray =
-        kotlinx.serialization.json.JsonObject(
+        JsonObject(
             mapOf(
                 "deviceId" to JsonPrimitive(info.deviceId),
                 "token" to JsonPrimitive(info.token),

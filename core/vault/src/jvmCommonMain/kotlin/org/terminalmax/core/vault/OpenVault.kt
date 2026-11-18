@@ -6,6 +6,9 @@ package org.terminalmax.core.vault
  * zeroes the key bytes. Instances produced by [withContent] and the codec's slot operations own independent
  * copies of the key and must be closed separately.
  *
+ * [keyEpoch] counts data-key replacements and [headerRevision] counts changes of the slot set; both are
+ * authenticated by the file they were read from.
+ *
  * Note: [content] itself is ordinary heap data (strings) and cannot be zeroed.
  */
 class OpenVault internal constructor(
@@ -19,6 +22,15 @@ class OpenVault internal constructor(
     private var closed = false
 
     val vaultId: String get() = header.vaultId
+
+    /** Number of times the data key has been replaced (starts at 1). */
+    val keyEpoch: Long get() = header.keyEpoch
+
+    /** Number of changes to the slot set (starts at 1). */
+    val headerRevision: Long get() = header.headerRevision
+
+    /** All key slots in the header. */
+    val slots: List<SlotInfo> get() = header.slots.map { SlotInfo(it.id, it.type) }
 
     /** Ids of all key slots in the header. */
     val slotIds: List<String> get() = header.slots.map { it.id }
@@ -39,5 +51,5 @@ class OpenVault internal constructor(
         key.fill(0)
     }
 
-    override fun toString(): String = "OpenVault(vaultId=$vaultId, revision=${content.revision})"
+    override fun toString(): String = "OpenVault(vaultId=$vaultId, revision=${content.revision}, keyEpoch=$keyEpoch)"
 }

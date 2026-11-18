@@ -33,8 +33,14 @@ class FakeDavServer(var config: Config = Config()) : AutoCloseable {
         val escapeQuotesInXml: Boolean = true,
         val credentials: Pair<String, String>? = null,
         val collectionExists: Boolean = true,
-        /** Replaces every PROPFIND body when set (used for XXE tests). */
+        /** Replaces every PROPFIND body when set (used for XXE and hostile-XML tests). */
         val propfindOverride: String? = null,
+        /** DELETE with a non-matching `If-Match` is answered with 412 and deletes nothing. */
+        val honourIfMatchOnDelete: Boolean = true,
+        /** Every PUT carrying `If-Match` is answered with 412, even with the correct ETag. */
+        val rejectAllIfMatch: Boolean = false,
+        /** When set, every file gets exactly this ETag (used for hostile-ETag tests). */
+        val etagOverride: String? = null,
     )
 
     class Logged(
@@ -55,6 +61,13 @@ class FakeDavServer(var config: Config = Config()) : AutoCloseable {
     /** Runs once, at the first GET of the vault file that follows a successful vault PUT. */
     @Volatile
     var afterPutBeforeNextGet: (() -> Unit)? = null
+
+    /**
+     * Runs before every request is evaluated (under the server lock, so it may change [files]); set it back to
+     * null inside the callback for a one-shot hook.
+     */
+    @Volatile
+    var beforeRequest: ((method: String, name: String) -> Unit)? = null
 
     @Volatile
     private var putSinceGet = false
@@ -85,6 +98,7 @@ class FakeDavServer(var config: Config = Config()) : AutoCloseable {
     }
 
     fun etagOf(bytes: ByteArray): String {
+        config.etagOverride?.let { return it }
         val hash = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }.take(16)
         return when (config.etagStyle) {
             EtagStyle.STRONG -> "\"$hash\""
@@ -122,10 +136,11 @@ class FakeDavServer(var config: Config = Config()) : AutoCloseable {
             return
         }
         val name = path.removePrefix("/dav/")
+        beforeRequest?.invoke(method, name)
         when (method) {
             "GET", "HEAD" -> get(ex, name)
             "PUT" -> put(ex, name, body)
-            "DELETE" -> if (files.remove(name) != null) respond(ex, 204) else respond(ex, 404)
+            "DELETE" -> delete(ex, name)
             "MKCOL" -> if (name.isEmpty() && !collectionCreated) {
                 collectionCreated = true
                 respond(ex, 201)
@@ -135,6 +150,20 @@ class FakeDavServer(var config: Config = Config()) : AutoCloseable {
             "PROPFIND" -> propfind(ex, name)
             else -> respond(ex, 405)
         }
+    }
+
+    private fun delete(ex: HttpExchange, name: String) {
+        val existing = files[name]
+        val ifMatch = ex.requestHeaders.getFirst("If-Match")
+        if (config.honourIfMatchOnDelete && ifMatch != null) {
+            val current = existing?.let { etagOf(it) }
+            val ok = current != null && (ifMatch.trim() == "*" || ifMatch.split(",").any { it.trim() == current && !it.trim().startsWith("W/") })
+            if (!ok) {
+                respond(ex, 412)
+                return
+            }
+        }
+        if (files.remove(name) != null) respond(ex, 204) else respond(ex, 404)
     }
 
     private fun get(ex: HttpExchange, name: String) {
@@ -168,6 +197,10 @@ class FakeDavServer(var config: Config = Config()) : AutoCloseable {
         val currentEtag = existing?.let { etagOf(it) }
         val ifMatch = ex.requestHeaders.getFirst("If-Match")
         val ifNoneMatch = ex.requestHeaders.getFirst("If-None-Match")
+        if (config.rejectAllIfMatch && ifMatch != null) {
+            respond(ex, 412)
+            return
+        }
         if (config.honourIfMatch && ifMatch != null) {
             val tokens = ifMatch.split(",").map { it.trim() }
             val ok = existing != null && (ifMatch.trim() == "*" || tokens.any { it == currentEtag && !it.startsWith("W/") })
@@ -192,6 +225,19 @@ class FakeDavServer(var config: Config = Config()) : AutoCloseable {
     private fun propfind(ex: HttpExchange, name: String) {
         config.propfindOverride?.let {
             respond(ex, 207, it.toByteArray(), mapOf("Content-Type" to "application/xml"))
+            return
+        }
+        if (name.isEmpty()) {
+            // Depth-1 listing of the collection: the collection itself plus every file.
+            val sb = StringBuilder("""<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">""")
+            sb.append("<D:response><D:href>/dav/</D:href></D:response>")
+            for ((fileName, content) in files) {
+                sb.append("<D:response><D:href>/dav/$fileName</D:href><D:propstat><D:prop><D:getetag>")
+                sb.append(etagOf(content).replace("\"", "&quot;"))
+                sb.append("</D:getetag></D:prop></D:propstat></D:response>")
+            }
+            sb.append("</D:multistatus>")
+            respond(ex, 207, sb.toString().toByteArray(), mapOf("Content-Type" to "application/xml"))
             return
         }
         val bytes = files[name]

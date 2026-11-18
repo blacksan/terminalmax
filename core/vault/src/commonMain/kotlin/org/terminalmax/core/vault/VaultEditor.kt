@@ -5,7 +5,9 @@ import kotlin.random.Random
 import kotlinx.serialization.json.JsonObject
 
 /**
- * Applies edits to a [VaultContent], incrementing the record revision and the content revision.
+ * Applies edits to a [VaultContent]. A new record revision is `max(record revision, content revision) + 1` (a
+ * Lamport rule: an edit made after seeing more history always outranks what it saw), the content revision follows,
+ * and neither can overflow: at the revision limit an edit fails with [VaultException.InvalidContent].
  *
  * @param clock source of the informational `updatedAtEpochMs` stamp (pass `System::currentTimeMillis`);
  *   it is never used for ordering.
@@ -17,6 +19,10 @@ class VaultEditor(
     private val clock: () -> Long = { 0L },
     private val newId: () -> String = { randomUuidV4() },
 ) {
+    init {
+        require(deviceId.isNotEmpty() && deviceId.length <= VaultContent.MAX_ID_CHARS) { "Invalid device id" }
+    }
+
     var content: VaultContent = content
         private set
 
@@ -28,12 +34,13 @@ class VaultEditor(
      */
     fun upsert(type: RecordType, id: String? = null, payload: JsonObject): VaultRecord {
         val recordId = id ?: newId()
+        require(recordId.isNotEmpty() && recordId.length <= VaultContent.MAX_ID_CHARS) { "Invalid record id" }
         val existing = content.records.firstOrNull { it.id == recordId }
         require(existing == null || existing.type == type) { "Record type cannot change" }
         val updated = VaultRecord(
             id = recordId,
             type = type,
-            revision = (existing?.revision ?: 0L) + 1L,
+            revision = nextRevision(maxOf(existing?.revision ?: 0L, content.revision)),
             deviceId = deviceId,
             updatedAtEpochMs = clock(),
             deleted = false,
@@ -82,7 +89,7 @@ class VaultEditor(
         val existing = content.records.firstOrNull { it.id == id } ?: return null
         if (existing.deleted) return existing
         val tombstone = existing.copy(
-            revision = existing.revision + 1L,
+            revision = nextRevision(maxOf(existing.revision, content.revision)),
             deviceId = deviceId,
             updatedAtEpochMs = clock(),
             deleted = true,
@@ -94,7 +101,10 @@ class VaultEditor(
 
     private fun store(record: VaultRecord) {
         val others = content.records.filterNot { it.id == record.id }
-        content = content.copy(revision = content.revision + 1L, records = others + record)
+        content = content.copy(
+            revision = maxOf(nextRevision(content.revision), record.revision),
+            records = others + record,
+        )
     }
 }
 
