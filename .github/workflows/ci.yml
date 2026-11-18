@@ -194,7 +194,7 @@ jobs:
               Where-Object { $_.FullName -match '\\app\\resources\\[^\\]+$' })
             if ($hits.Count -ne 1) {
               Get-ChildItem -Path $target -Recurse -File | Select-Object -ExpandProperty FullName
-              throw "$name: expected exactly one copy under app\resources inside the MSI, found $($hits.Count)"
+              throw "${name}: expected exactly one copy under app\resources inside the MSI, found $($hits.Count)"
             }
             Write-Host "OK: $($hits[0].FullName) ($($hits[0].Length) bytes)"
           }
