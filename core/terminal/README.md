@@ -79,7 +79,7 @@ The host is treated as hostile. Data flows UTF-8 decoder -> `EscapeSequenceFilte
 
 | Threat | Mitigation |
 | --- | --- |
-| `CSI 8;rows;cols t` (huge or drifting size) | Remote resize requests are **ignored** (`RequestOrigin.Remote`); local resizes and the initial size are clamped to `TerminalLimits` (2..1000 columns, 2..500 rows). |
+| `CSI 8;rows;cols t` (huge or drifting size) | Remote resize requests are **ignored** (`RequestOrigin.Remote`); local resizes and the initial size are clamped to `TerminalLimits` (5..1000 columns, 2..500 rows). |
 | Unterminated or huge escape sequences (quadratic re-parsing, unbounded memory) | The filter holds unfinished sequences itself and forwards only complete ones. CSI: at most 256 characters and 32 parameters, otherwise dropped. OSC: payload at most 64 KiB (4 KiB for titles 0/1/2), otherwise the whole sequence is dropped and the rest is discarded up to its terminator without being buffered. The emulator retry buffer is additionally capped at 64 KiB (`JediTermEngine.pendingChars` is the test hook). |
 | Integer overflow in numeric parameters | Every CSI number is clamped to 65535 by rewriting its digits. |
 | DCS, APC, PM, SOS, C1 controls (U+0080..U+009F) | Never forwarded. OSC is forwarded normalised as `ESC ] payload BEL`. Strings end at BEL, `ESC \` or U+009C; `ESC` followed by anything else aborts the string; CAN and SUB abort a sequence. |

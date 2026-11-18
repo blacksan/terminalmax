@@ -5,7 +5,7 @@ import kotlinx.coroutines.flow.StateFlow
 
 /** Size bounds every [TerminalEngine] enforces, regardless of what the caller or the host asks for. */
 object TerminalLimits {
-    const val MIN_COLS = 2
+    const val MIN_COLS = 5
     const val MAX_COLS = 1000
     const val MIN_ROWS = 2
     const val MAX_ROWS = 500

@@ -314,7 +314,8 @@ class SshjTransportIntegrationTest {
         val e = assertFailsWith<SshException.Protocol> {
             transport.connect(localTarget(), password(), HostKeyVerifier { _, _, _, _, _ -> throw boom })
         }
-        assertTrue(e.cause === boom, "cause was ${e.cause}")
+        // Coroutine stack-trace recovery may wrap the exception in a copy, so walk the cause chain.
+        assertTrue(generateSequence<Throwable>(e) { it.cause }.any { it === boom }, "cause chain was ${e.cause}")
         assertFalse(e.message.orEmpty().contains("rejected"))
     }
 
