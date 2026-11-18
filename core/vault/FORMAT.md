@@ -26,25 +26,25 @@ type, a party that can write the file (a hostile or compromised server) could mi
 chose, wrapped to the real devices' public keys, and honest devices would adopt that epoch because they can open it.
 A slot that anyone can create is not a slot that proves anything about who wrote the file.
 
-So the header holds **password slots only** (at most 2). Convenience unlock on a device (biometrics, the OS
+So the header holds **exactly one password slot**. Convenience unlock on a device (biometrics, the OS
 keychain) is not part of the file: an open vault can export a *local unlock secret* (see below) that the device
 keeps in its own secure storage. A password change replaces the data key, which revokes every such secret.
 
 ## Limits enforced before any key derivation
 
 * whole file at most 8 MiB, header at most 64 KiB;
-* at most 16 slots parsed and at most **2** password slots;
-* every password slot: memory 8 MiB to 1 GiB (8192 to 1048576 KiB), iterations 1 to 10, parallelism 1 to 16;
-* total key-derivation cost, the sum over password slots of `memoryKiB x iterations`, at most 4 x 65536 x 3
-  (786432): two slots at the defaults (64 MiB, t = 3) fit with room to spare;
-* a reader applies a platform memory ceiling to every slot (default **128 MiB**, `KdfParams.PLATFORM_CEILING_KIB`,
-  twice the 64 MiB default; callers on small devices pass a lower one). A slot above the ceiling makes the file
-  unopenable on that device (`KdfCostTooHigh`) without any derivation having been run. The Argon2 implementation is
-  pure JVM and allocates its whole matrix up front, so the ceiling is a heap bound, not only a time bound.
+* the header holds **exactly one** slot (zero or several is `InvalidFormat`, before any derivation);
+* the slot: memory 8 MiB to 1 GiB (8192 to 1048576 KiB), iterations 1 to 10, parallelism 1 to 16;
+* total key-derivation cost `memoryKiB x iterations` at most 4 x 65536 x 3 (786432);
+* a reader applies a platform memory ceiling (default **128 MiB**, `KdfParams.PLATFORM_CEILING_KIB`, twice the
+  64 MiB default; callers on small devices pass a lower one, and a session passes its ceiling to **every** key
+  derivation: open, re-key adoption, password change, join). A slot above the ceiling makes the file unopenable on
+  that device (`KdfCostTooHigh`) without any derivation having been run. The Argon2 implementation is pure JVM and
+  allocates its whole matrix up front, so the ceiling is a heap bound, not only a time bound; an
+  `OutOfMemoryError` raised inside the derivation is reported as `KdfCostTooHigh` too.
 
-A header that breaks a limit is rejected before the first Argon2 call, so a hostile file cannot make a device spend
-unbounded time or memory. When a caller remembers which password slot opened the vault last, that slot is tried
-first.
+A header that breaks a limit is rejected before the Argon2 call, so a hostile file cannot make a device spend
+unbounded time or memory.
 
 ## Header
 
@@ -55,7 +55,6 @@ Compact JSON written in the field order below, unknown fields rejected, `epochLi
   "kdf": "argon2id",
   "vaultId": "<uuid>",
   "keyEpoch": 2,
-  "headerRevision": 2,
   "slots": [
     {"id": "pw-<16 hex>", "type": "password", "salt": "<b64, 16 bytes>",
      "memoryKiB": 65536, "iterations": 3, "parallelism": 4,
@@ -70,21 +69,24 @@ Compact JSON written in the field order below, unknown fields rejected, `epochLi
 Base64 is the standard alphabet with padding. Slot ids are unique and at most 128 characters; `vaultId` is at most 128
 characters. Slot `type` must be `"password"`; anything else is rejected.
 
-* `keyEpoch` (1 to 2^32 - 1) counts how often the data key has been replaced. The data key is replaced whenever a
-  password is changed and whenever a slot is removed.
-* `headerRevision` (1 to 2^53 - 1) counts changes of the slot set (adding a slot, removing a slot, changing a
-  password). A writer re-seals with the header of the highest `headerRevision` it has seen, so a slot change made on
-  another device is not undone by an ordinary content update.
+* `keyEpoch` (1 to 2^32 - 1) counts how often the data key has been replaced. The data key is replaced whenever the
+  password (or the key-derivation cost) is changed: that is the only operation that changes the slot.
+* **The header is immutable within a key epoch.** Every field except `writeSalt` is fixed when the epoch is created.
+  There is no header revision, no second slot and no slot removal: any slot or KDF change is a rotation to epoch + 1
+  with a fresh data key, a fresh `keyCommit` and an `epochLink`. A sync reader that holds the key of epoch *n* and is
+  shown a file of epoch *n* whose header differs from the one it holds (apart from `writeSalt`) **refuses** it
+  (`HeaderMismatchSameEpoch`): it never adopts, merges or re-seals the foreign header. This closes the attack in
+  which a holder of the data key (a stolen unlock secret, a compromised device) substitutes a password slot of its
+  own: the data key does not authorise any change of the slot.
 * `writeSalt` is fresh random data for every write.
 * `keyCommit` and `epochLink` are described under *Key commitment and the epoch chain*.
-* Readers (the sync layer) persist the highest `keyEpoch`, `headerRevision` and content revision per `vaultId` and
-  reject a file with a lower value as a rollback. The format only provides the authenticated numbers; enforcing the
-  floors is the sync layer's job, and a device's first sight of a vault is accepted on trust.
+* Readers (the sync layer) persist the highest `keyEpoch` and content revision per `vaultId` and reject a file with
+  a lower value as a rollback. The format only provides the authenticated numbers; enforcing the floors is the sync
+  layer's job, and a device's first sight of a vault is accepted on trust.
 
 ## Keys
 
-* The **data key** is 32 random bytes per key epoch. Only a password change or a slot removal creates a new one (see
-  *Rotation*).
+* The **data key** is 32 random bytes per key epoch. Only a password change creates a new one (see *Rotation*).
 * **Password**: the caller's characters are normalised to Unicode **NFC** (`java.text.Normalizer`), then encoded
   as strict UTF-8. An unpaired surrogate is an error (`IllegalArgumentException`), never silently replaced, so two
   different passwords cannot derive the same key. A password typed with a composed character and the same password
@@ -105,24 +107,28 @@ characters. Slot `type` must be `"password"`; anything else is rejected.
   does not match is skipped; this makes it impossible for one file to open to different contents under different
   keys, which AES-GCM alone does not rule out.
 * **epochLink**, present exactly when `keyEpoch >= 2`, absent at epoch 1:
-  `linkKey = HKDF-SHA256(ikm = previousDataKey, salt = vaultId (UTF-8), info = "tmx-epoch-link" || u32(previousEpoch),
+  `linkKey = HKDF-SHA256(ikm = previousDataKey, salt = vaultId (UTF-8), info = "TMXV2 epoch link key" || u32(previousEpoch),
   length 32)` and
   `epochLink = HMAC-SHA256(linkKey, "TMXV2 epoch link" || lp(vaultId) || u32(newEpoch) || newKeyCommit)`.
   Only a party that held the previous epoch's data key can produce a valid link to the next epoch. A device that
   holds epoch *n* can therefore tell a re-key by a holder of *n* (the link verifies, `VaultCodec.verifyEpochLink`
   returns `Verified`) from a file that merely claims a higher epoch (`Unverified`), without being able to decrypt
   the new epoch.
-* The link covers the vault id, the new epoch and the new key commitment. **It does not cover the slots.** Slots are
-  covered by the content tag instead (the stored header bytes are the content AAD), so changing a slot makes the
-  content fail to decrypt, but a party that holds no key cannot be prevented from replacing a header and ciphertext
-  wholesale with an older, authentic pair of the same epoch; that is rollback, handled by the sync layer's floors.
+* The link covers the vault id, the new epoch and the new key commitment. **It does not cover the slot.** The slot is
+  covered by the content tag instead (the stored header bytes are the content AAD), so a party without the data key
+  cannot change it. **A party that holds the data key of an epoch can re-seal a file of that epoch with any header it
+  likes**; the format cannot prevent that, which is why a sync reader compares the header with the one it holds and
+  refuses a mismatch (see *Header*). A party that holds no key can replace a header and ciphertext wholesale with an
+  older, authentic pair of the same epoch; that is rollback, handled by the sync layer's floors.
 * The chain is one step at a time: a device two or more epochs behind cannot verify the newest file against its key
   (`Unverified`) and must be reopened with the password. The sync layer reports that as
-  `SyncWarning.KeyEpochChainUnverified` instead of adopting the file silently.
+  `SyncWarning.KeyEpochChainUnverified` instead of adopting the file silently. A same-epoch file under a different
+  key (two devices that created the same vault id) is the same case with `fromEpoch == toEpoch`.
 * The chain proves "written by someone who held the previous key". It does not prove that the previous key's holder
-  was authorised: someone whose password was removed but who still has the old data key can still link a new epoch to
-  it. Removal protects what is written after a rotation that the removed party did not take part in, not a party
-  that is already inside and cooperating with the server.
+  was authorised, and a *verified* link is not "trusted": a stolen local unlock secret holds the previous key. A
+  party that held the old key (a removed device, a leaked unlock secret) can still **mint a linked next epoch** for
+  devices that have not seen the real rotation, and opening it needs a password for it: the password is what
+  authorises an epoch, the chain only orders them.
 
 ## Local unlock secret
 
@@ -150,7 +156,7 @@ contentAAD = "TMXV" || u16(2) || header bytes exactly as stored (never a re-seri
 ```
 
 Because the stored header bytes are authenticated, any change to the header (slots, KDF parameters, vault id, key
-epoch, header revision, write salt, key commitment, epoch link) makes the content fail to decrypt. The slot AAD binds
+epoch, write salt, key commitment, epoch link) makes the content fail to decrypt. The slot AAD binds
 a wrapped key to its vault, its key epoch and its slot parameters, so a slot cannot be moved to another vault,
 another epoch or another position.
 
@@ -207,16 +213,23 @@ revision) is done by the sync layer from digests of files it has seen.
 
 ## Rotation
 
-* `changePassword` and `removeSlot` **replace the data key**: `keyEpoch + 1`, `headerRevision + 1`, a new
-  `keyCommit`, an `epochLink` to the previous epoch and a new `writeSalt` on the next seal. **Other password slots
-  can only be re-wrapped with their password**, so the caller must supply those passwords (they are verified against
-  the old slots); a device that does not know them cannot rotate past them. At least one password slot must remain.
-* After removal, the holder of the removed slot's password can no longer read or forge anything written afterwards by
-  a device that did the rotation. Copies of the file from before the removal stay readable to that holder; no format
-  can prevent that.
-* `addPasswordSlot` keeps the data key and only raises `headerRevision` (at most 2 password slots).
-* Two devices that rotate independently to the same epoch produce files the other cannot decrypt; sync reports that
-  the vault must be re-opened with the password. The format does not merge rotations.
+* `changePassword` is the only operation that touches the slot. It **replaces the data key**: `keyEpoch + 1` (or
+  higher, for a replacement published by `VaultSession.replaceRemoteWithLocal`), a new slot (new salt, new nonce, the
+  new password and, optionally, new KDF parameters; the slot id is kept), a new `keyCommit`, an `epochLink` to the
+  previous epoch and a new `writeSalt` on the next seal.
+* The holder of the old password can no longer read or forge anything written afterwards by a device that did the
+  rotation. Copies of the file from before the rotation stay readable to that holder, and it can still mint a linked
+  next epoch from the old key for devices that have not seen the rotation (see the epoch chain). No format can
+  prevent that. **Revoking a lost device therefore takes two actions: change the vault password and change the
+  WebDAV credential.**
+* There is no `addPasswordSlot` and no `removeSlot`: a second password would be an extra way to rewrite the vault
+  and the review found no safe way to merge slot changes of two devices. Several people sharing a vault share one
+  password.
+* Two devices that rotate independently to the same epoch produce files the other cannot decrypt. The sync layer
+  prevents this for its own password-change transaction (it uploads only if the remote is still exactly what it
+  last synced), and reports a competing key at the same epoch as a re-key that needs the password
+  (`FailureReason.ReopenRequired`; `SyncWarning.ConcurrentRekeyAdopted` once adopted). The format does not merge
+  rotations.
 
 ## Errors
 
@@ -227,19 +240,26 @@ revision) is done by the sync layer from digests of files it has seen.
 | Bad magic, truncated, oversized, bad header length, format version 1 (or any version below 2) | `InvalidFormat` |
 | Format version above 2, or a schema version newer than supported | `UnsupportedVersion` |
 | KDF parameters outside the per-field bounds | `KdfParamsOutOfRange` |
-| Platform memory ceiling or total cost budget exceeded, too many password slots | `KdfCostTooHigh` |
+| Platform memory ceiling or total cost budget exceeded, or the derivation ran out of memory | `KdfCostTooHigh` |
+| A header with zero or several password slots, or a field this format does not have (for example `headerRevision`) | `InvalidFormat` / `BadPasswordOrCorrupt` (never reaches a key derivation) |
+| Same key epoch, other header than the held one (sync layer) | `HeaderMismatchSameEpoch` |
+| Same key epoch, another data key than the held one (sync layer) | `KeyMismatchSameEpoch` |
 | Authentic file whose content breaks the content rules | `InvalidContent` |
 | Key (data key or local unlock secret) of another epoch than the file's | `KeyEpochMismatch` |
 | Another vault id (data-key open, merge) | `DifferentVault` |
-| Slot id that does not exist | `NoSuchSlot` |
 
 A vault whose schema is newer than the app supports is never written.
 
 ## Known-answer data
 
-`VaultFormatV2Test` holds two complete files (epoch 1, and epoch 2 with a link) produced by a separate encoder
-program that re-implements the container, HKDF, the AAD construction and the AES-GCM calls on its own with plain
-`javax.crypto`; they must open with the password and with the local unlock secret. Both sides use the same
-BouncyCastle Argon2id implementation, so the Argon2id output itself is **not** independently checked here (RFC 9106
-vectors are not in the suite). The encoder is a test fixture written by the same authors, so these vectors catch
-accidental drift of the format, not a shared misreading of this document.
+* `VaultFormatV2Test` holds complete files (epoch 1 and epoch 2 with a link, in an ASCII and in a Unicode variant:
+  non-ASCII vault and slot ids, an NFD password with an emoji) that open with the password and with the local
+  unlock secret. They are produced by `core/vault/src/desktopTest/resources/golden/GoldenGen.java`, which is
+  committed: a standalone program that re-implements the container, HKDF, the AAD construction and the AES-GCM calls
+  with plain `javax.crypto` and takes only Argon2id from BouncyCastle. Run it with
+  `java -cp bcprov.jar GoldenGen.java`; it prints the Kotlin constants, so the files are reproducible and
+  auditable. It is a fixture by the same authors: it catches accidental drift of the format, not a shared
+  misreading of this document.
+* The Argon2id implementation is checked against the **RFC 9106 section 5.3 test vector** (with secret and
+  associated data), so it is no longer only compared with itself. HKDF is checked against RFC 5869 test case 1.
+  `goldenGcm` is computed with the same JCA the code uses, so it is not an independent AES-GCM known answer.

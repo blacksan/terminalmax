@@ -4,6 +4,7 @@ package org.terminalmax.core.sync
 import java.security.MessageDigest
 import java.security.SecureRandom
 import org.terminalmax.core.vault.EpochLinkStatus
+import org.terminalmax.core.vault.KdfParams
 import org.terminalmax.core.vault.OpenVault
 import org.terminalmax.core.vault.VaultCodec
 import org.terminalmax.core.vault.VaultContent
@@ -13,34 +14,34 @@ import org.terminalmax.core.vault.VaultException
  * [VaultCodecHooks] backed by an [OpenVault] (which holds the data key). Remote files are opened with the data
  * key, so no password is needed during sync. Owned by `VaultSession`; not part of the public API.
  *
- * The hooks keep their own copy of the vault. They always hold the newest **authenticated** header they have read:
- * when a file at the current key epoch has a header at least as new as the held one, it replaces the held one (within
- * one epoch the slot set only grows, and the file is authenticated by the same key), so a device never writes back
- * a stale header.
+ * **The header is immutable within a key epoch**: the hooks never adopt a header from a file. [decrypt] refuses a
+ * file of the held epoch and key whose header differs (`HeaderMismatchSameEpoch`), so a holder of the data key (a
+ * local unlock secret, a compromised device, a malicious co-user) cannot rewrite the password slot of everyone else.
  *
  * Key changes happen in exactly three places, each of which zeroes the superseded key right away: [reopen] (the
  * vault was re-keyed elsewhere; opened with the password), [commitStaged] (a password change this device published)
  * and [close]. Because a password change is committed only after the upload is confirmed, there is never an
  * unpublished newer key to remember, and no old keys are retained.
+ *
+ * @param memoryCeilingKiB the most memory this device spends on one key derivation; applied to every [reopen]
  */
-internal class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoCloseable {
+internal class OpenVaultCodecHooks(
+    vault: OpenVault,
+    private val memoryCeilingKiB: Int = KdfParams.PLATFORM_CEILING_KIB,
+) : VaultCodecHooks, AutoCloseable {
     private val lock = Any()
     private var current: OpenVault = vault.withContent(vault.content)
     private val random = SecureRandom()
 
     override val keyEpoch: Long get() = synchronized(lock) { current.keyEpoch }
 
-    override val headerRevision: Long get() = synchronized(lock) { current.headerRevision }
+    /** The comparable key identity of the held key (see [OpenVault.fingerprint]). */
+    val keyFingerprint: String get() = synchronized(lock) { current.fingerprint }
 
     override fun decrypt(bytes: ByteArray): DecryptedVault = synchronized(lock) {
         val opened = VaultCodec.openWithDataKey(bytes, current)
         try {
-            if (opened.headerRevision >= current.headerRevision) {
-                val old = current
-                current = opened.withContent(old.content)
-                old.close()
-            }
-            DecryptedVault(opened.content, opened.keyEpoch, opened.headerRevision)
+            DecryptedVault(opened.content, opened.keyEpoch)
         } finally {
             opened.close()
         }
@@ -49,7 +50,7 @@ internal class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoClos
     override fun encrypt(content: VaultContent): EncryptedVault = synchronized(lock) {
         val toSeal = current.withContent(content)
         try {
-            EncryptedVault(VaultCodec.seal(toSeal), toSeal.keyEpoch, toSeal.headerRevision)
+            EncryptedVault(VaultCodec.seal(toSeal), toSeal.keyEpoch)
         } finally {
             toSeal.close()
         }
@@ -73,15 +74,24 @@ internal class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoClos
     }
 
     override fun reopen(bytes: ByteArray, password: CharArray): ReopenResult = synchronized(lock) {
-        val opened = VaultCodec.open(bytes, password)
+        val opened = VaultCodec.open(bytes, password, memoryCeilingKiB)
         try {
             if (opened.vaultId != current.vaultId) throw VaultException.DifferentVault()
-            if (opened.keyEpoch <= current.keyEpoch) throw VaultException.BadPasswordOrCorrupt()
-            val chain = epochChain(bytes)
+            val sameEpoch = opened.keyEpoch == current.keyEpoch
+            if (opened.keyEpoch < current.keyEpoch) throw VaultException.BadPasswordOrCorrupt()
+            // At the same epoch only a file under ANOTHER key is a reopen; the same key is the header-mismatch case.
+            if (sameEpoch && opened.hasSameKeyAs(current)) throw VaultException.BadPasswordOrCorrupt()
+            val chain = if (sameEpoch) EpochChain.NotApplicable else epochChain(bytes)
+            // A genuine password change never keeps the password: if it also opens the slot held so far, warn.
+            val unchanged = try {
+                VaultCodec.verifyPassword(current, password, memoryCeilingKiB)
+            } catch (e: VaultException) {
+                false
+            }
             val old = current
             current = opened.withContent(old.content)
             old.close()
-            ReopenResult(chain)
+            ReopenResult(chain, sameEpoch = sameEpoch, passwordUnchanged = unchanged)
         } finally {
             opened.close()
         }
@@ -92,10 +102,8 @@ internal class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoClos
     private class Staged(
         val vault: OpenVault,
         override val baseKeyEpoch: Long,
-        override val baseHeaderRevision: Long,
     ) : StagedHeaderChange {
         override val keyEpoch: Long get() = vault.keyEpoch
-        override val headerRevision: Long get() = vault.headerRevision
         var committed = false
 
         override fun discard() {
@@ -111,7 +119,7 @@ internal class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoClos
     fun stage(build: (OpenVault) -> OpenVault): StagedHeaderChange = synchronized(lock) {
         val copy = current.withContent(current.content)
         try {
-            Staged(build(copy), current.keyEpoch, current.headerRevision)
+            Staged(build(copy), current.keyEpoch)
         } finally {
             copy.close()
         }
@@ -123,7 +131,7 @@ internal class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoClos
     override fun encryptStaged(content: VaultContent, staged: StagedHeaderChange): EncryptedVault = synchronized(lock) {
         val toSeal = asStaged(staged).vault.withContent(content)
         try {
-            EncryptedVault(VaultCodec.seal(toSeal), toSeal.keyEpoch, toSeal.headerRevision)
+            EncryptedVault(VaultCodec.seal(toSeal), toSeal.keyEpoch)
         } finally {
             toSeal.close()
         }

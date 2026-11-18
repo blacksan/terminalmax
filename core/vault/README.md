@@ -22,31 +22,37 @@ reopened.close()                                          // zeroes the data key
 val secret = reopened.exportLocalUnlockSecret()
 val again = VaultCodec.openWithLocalUnlockSecret(file, secret)   // KeyEpochMismatch once the vault has been re-keyed
 
-// Key rotation: both of these replace the data key (key epoch + 1, linked to the previous epoch).
+// Key rotation: the only slot operation. It replaces the data key (key epoch + 1, linked to the previous epoch).
 val rotated = VaultCodec.changePassword(vault, newPassword)
-val trimmed = VaultCodec.removeSlot(vault, slotId, passwords = mapOf(otherSlotId to itsPassword))
+
+// What a user compares across devices before trusting a vault: six groups of four hex characters.
+val fingerprint = reopened.fingerprint
 ```
 
 Most applications use `:core:sync`'s `VaultSession`, which wraps this codec together with persistence and sync.
 
 ## What version 2 is
 
-* **Password slots only** (at most 2). There are no device or public-key slots: with a public-key slot anyone who can
-  read the header could mint a key epoch honest devices would adopt (FORMAT.md explains this). Convenience unlock is
-  a local secret that a device keeps in its own secure storage, outside the file.
-* A **key epoch** and a **header revision** are part of the authenticated data, so a replayed old header (an old
-  password, a removed slot) is recognisable by the sync layer, which remembers the highest values.
-* **Data-key rotation**: a password change and a slot removal replace the data key. The old password cannot read or
-  forge anything written afterwards (old copies of the file stay readable to its holder). Other password slots must
-  be supplied with their password when rotating.
+* **One password slot.** There are no device or public-key slots and no second password: with a public-key slot
+  anyone who can read the header could mint a key epoch honest devices would adopt, and with several slots every
+  holder of the data key could substitute one (FORMAT.md explains both). Convenience unlock is a local secret that a
+  device keeps in its own secure storage, outside the file.
+* **An immutable header per key epoch.** Everything but the write salt is fixed when the epoch is created; the
+  **key epoch** is part of the authenticated data, so a replayed old header (an old password) is recognisable by the
+  sync layer, which remembers the highest epoch and refuses a same-epoch file with another header
+  (`HeaderMismatchSameEpoch`) instead of adopting it.
+* **Data-key rotation**: a password change replaces the data key and is the only slot operation. The old password
+  cannot read or forge anything written afterwards by a device that did the rotation (old copies of the file stay
+  readable to its holder, who can also mint a linked next epoch for devices that have not seen the rotation).
+  Revoking a lost device means changing the vault password **and** the WebDAV credential.
 * **Key commitment and epoch chain**: the header commits to the data key, and every epoch above 1 carries an HMAC
   under a key derived from the previous epoch's data key. A device can tell "re-keyed by a holder of my key" from "a
   file that merely claims a higher epoch" (`VaultCodec.verifyEpochLink`, `SyncWarning.KeyEpochChainUnverified`). The
-  link does not cover the slots (FORMAT.md).
+  link does not cover the slot, and a verified link is not "trusted" (FORMAT.md).
 * A **fresh content key per write** (HKDF from the data key and a random write salt), so there is no nonce budget.
-* **Bounded key derivation**: at most 2 password slots, default 64 MiB (ceiling 128 MiB on a reader), per-slot and
-  total cost limits, all checked before the first Argon2 call. The slot that opened the vault last
-  (`preferredSlotId`) is tried first.
+* **Bounded key derivation**: exactly one slot, default 64 MiB (ceiling 128 MiB on a reader; callers pass a lower
+  one), per-field and total cost limits, all checked before the Argon2 call. Running out of memory inside the
+  derivation is reported as `KdfCostTooHigh`, not as a crash.
 * **Content validation** on open, before merge and before seal: revision bounds, no record revision above the
   content revision, unique non-empty ids, one id one type, record count and size caps (`InvalidContent`).
 * **Passwords** are NFC-normalised and encoded as strict UTF-8 (an unpaired surrogate is an error).
@@ -79,27 +85,32 @@ rejected.
 
 Protects confidentiality and integrity of vault contents against anyone who can read or modify the stored file
 (a malicious or compromised file server, a stolen backup). An attacker holding the file can attempt offline
-password guessing; Argon2id cost is the defence, and a weak password stays weak. The file leaks its size, the number
-and type of key slots, the KDF parameters, the key epoch and the header revision.
+password guessing; Argon2id cost is the defence, and a weak password stays weak. The file leaks its size, the KDF parameters and the key epoch.
 
 What the format does **not** do by itself:
 
-* It does not detect rollback to an older authentic file. It supplies authenticated key epoch and header revision, and
-  the sync layer remembers the highest values; the first file a device ever sees is accepted on trust.
+* It does not detect rollback to an older authentic file. It supplies the authenticated key epoch, and the sync
+  layer remembers the highest values; the first file a device ever sees is accepted on trust (compare the
+  fingerprint across devices).
 * Rotation cannot take back copies the removed party already has, and the epoch chain only proves that a re-key was
   made by someone who held the previous key, not that they were still authorised to.
-* Two devices that rotate the key independently produce files the other cannot read; one of them has to re-open
-  the vault.
+* Whoever holds the data key of an epoch (an exported local unlock secret, a compromised device) can re-seal files
+  of that epoch with any header. The format cannot stop it; the sync layer refuses such a file on every device that
+  holds the same key, and only the password (never the data key) opens a new epoch.
+* Two devices that rotate the key independently produce files the other cannot read; the sync layer prevents this
+  for its own transaction and otherwise needs the password on the losing device.
 * It does not protect against malware on a device that has the vault open. Decrypted records are ordinary JVM
-  strings and cannot be wiped; JCA/BouncyCastle key objects are zeroed where the library allows it, and some
-  intermediate copies (for example the `String` of a normalised password) are not wipeable.
+  strings and cannot be wiped. The data key and the derived keys held by this library are zeroed on `close()`, but
+  the JCA and BouncyCastle objects built from them (`SecretKeySpec`, cipher state) hold their own copies that
+  nothing here can wipe, and some intermediate copies (for example the `String` of a normalised password) are not
+  wipeable either.
 
 ## Not done yet
 
 * Tombstone garbage collection (`pruneTombstones` exists but is unused).
 * Secure storage of the local unlock secret (Android Keystore / DPAPI / macOS Keychain); the codec only produces and
   consumes the raw bytes.
-* Independent known-answer data for Argon2id (RFC 9106 vectors). The suite has two complete golden files from a
-  separate encoder program, and the other primitives were checked against RFC 5869 and AES-GCM answers, but both
-  encoder and codec use the same BouncyCastle Argon2id, and the golden files are a fixture by the same authors.
+* Independent known-answer data for AES-GCM and HKDF beyond RFC 5869 test case 1. Argon2id is checked against the
+  RFC 9106 test vector, and the golden files are reproducible from the committed
+  `src/desktopTest/resources/golden/GoldenGen.java`, but that generator is a fixture by the same authors.
 * UI and a password-change flow beyond `VaultSession`.

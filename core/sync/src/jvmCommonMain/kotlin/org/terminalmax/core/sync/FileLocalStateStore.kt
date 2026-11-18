@@ -17,7 +17,6 @@ import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.encoding.Base64
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -30,6 +29,9 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 
+/** Where a salvaged state came from (see [FileLocalStateStore.salvageCandidates]). */
+enum class SalvageSource { Current, CurrentIgnoringChecksum, Previous, PreviousIgnoringChecksum }
+
 /**
  * File-backed [LocalStateStore]: the rollback floors, the merge base (the encrypted file as last synced), the
  * file digests used for fork detection, and the per-server probe result survive restarts, so rollback protection
@@ -37,19 +39,30 @@ import kotlinx.serialization.json.long
  *
  * Layout: one state file, `<directory>/<fileName>`. It holds `"TMXS" | u8 version | SHA-256(payload) | payload`
  * where the payload is JSON: the floors, digests and probe results, the base file, and (when a `VaultSession` owns the
- * directory) the sealed local vault file and the device id. **That single file is the manifest**: it is replaced
- * atomically, so the local vault and the sync state cannot diverge after a crash. It contains no plaintext secrets
- * (the vault files are ciphertext), but it should still live in the app's private storage; whoever can rewrite it can
- * lower the floors or substitute an older local vault.
+ * directory) the sealed local vault file, an unpublished password change and the device id. **That single file is the
+ * manifest**: it is replaced atomically, so the local vault and the sync state cannot diverge after a crash. It
+ * contains no plaintext secrets (the vault files are ciphertext), but it should still live in the app's private
+ * storage; whoever can rewrite it can lower the floors or substitute an older local vault.
  *
- * Atomicity: [save] writes `<fileName>.tmp` completely, forces it to disk (`fsync`), then renames it over the
- * state file with an atomic move and forces the directory. A crash at any point leaves either the old state or the
- * new one; a leftover temp file is ignored and overwritten by the next save. The checksum catches torn or
- * damaged files: [load] then throws [LocalStateException] and the engine fails closed, because silently starting
- * from an empty state would switch rollback protection off. [reset] is the explicit way out.
+ * **Durability.** [save] writes `<fileName>.tmp` completely and forces it to disk (`fsync`); then it renames the
+ * current file to `<fileName>.prev` (replacing the previous copy), renames the temp file over the state file and
+ * forces the directory. So there is always a rolling previous copy of the state. A crash at any point leaves the
+ * old state or the new one: between the two renames only `.prev` exists, and [load] then uses it (it is the last
+ * state that was ever acknowledged). Renames use an atomic move and, where the file system cannot do that or
+ * another process (an antivirus scanner, an indexer, a sync client) briefly holds the target open on Windows,
+ * retry a few times and finally fall back to a plain replace; the previous copy makes that fallback safe. Note that
+ * on macOS `fsync` does not force the drive cache (`F_FULLFSYNC`), so a power loss can still cost the last save.
  *
- * Concurrency: [exclusive] holds a per-path mutex (same process) and an OS file lock on `<fileName>.lock` (other
- * processes) for the duration of a sync, so two engines can never interleave their load/save steps.
+ * **Damage.** The checksum catches torn or damaged files: [load] then throws [LocalStateException] and everything
+ * above it fails closed, because silently starting from an empty state would switch rollback protection off and
+ * make the only copy of unsynced edits unreachable. The damaged file is never replaced or deleted by the store.
+ * [salvageCandidates] reads the damaged file leniently and the previous copy so that the vault content can still be
+ * recovered with the password (`VaultSession.salvage`). [reset] never deletes the vault content.
+ *
+ * **Concurrency.** [exclusive] is a per-path in-process mutex around one load-modify-save; it holds no file lock and
+ * must not contain network I/O. Exclusion from other processes (and from a second session in this process) is
+ * [lockDirectory], an OS-level lock held for the lifetime of a `VaultSession`. Without it a state store has no
+ * protection against another process.
  *
  * @param directory a directory supplied by the app (for example `context.filesDir` + "/sync"); created if missing
  */
@@ -57,13 +70,26 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
     private val dir: File = directory.absoluteFile
     private val stateFile = File(dir, fileName)
     private val tempFile = File(dir, "$fileName.tmp")
+    private val prevFile = File(dir, "$fileName.prev")
     private val lockFile = File(dir, "$fileName.lock")
 
     @Volatile
     private var cached: LocalSyncState? = null
 
-    /** Test hook: runs after the temp file is durable and before it is renamed (to simulate a crash there). */
+    /** Size and modification time of the state file when it was last read or written (to notice foreign changes). */
+    @Volatile
+    private var stamp: Pair<Long, Long>? = null
+
+    /** True when the last [load] came from the rolling previous copy because the state file itself was missing. */
+    @Volatile
+    var loadedFromPrevious: Boolean = false
+        private set
+
+    /** Test hook: runs after the temp file is durable and before anything is renamed (to simulate a crash there). */
     internal var beforeRenameHook: (() -> Unit)? = null
+
+    /** Test hook: runs between "state -> .prev" and "temp -> state" (the window in which only `.prev` exists). */
+    internal var betweenRenamesHook: (() -> Unit)? = null
 
     override suspend fun load(): LocalSyncState {
         cached?.let { return it }
@@ -78,87 +104,140 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
     }
 
     override suspend fun <T> exclusive(block: suspend () -> T): T {
-        val key = try {
-            stateFile.canonicalPath
-        } catch (e: IOException) {
-            stateFile.absolutePath
-        }
-        val mutex = mutexes.computeIfAbsent(key) { Mutex() }
+        val mutex = mutexes.computeIfAbsent(pathKey()) { Mutex() }
         return mutex.withLock {
-            cached = null // another process may have changed the file since this instance last looked
-            val channel = withContext(Dispatchers.IO) { openLockChannel() }
+            // Another store object on the same file (a test, a tool) may have written since this one looked.
+            if (stamp != statFile()) cached = null
+            block()
+        }
+    }
+
+    private fun pathKey(): String = try {
+        stateFile.canonicalPath
+    } catch (e: IOException) {
+        stateFile.absolutePath
+    }
+
+    private fun statFile(): Pair<Long, Long>? = if (stateFile.exists()) stateFile.length() to stateFile.lastModified() else null
+
+    /**
+     * Takes the OS-level lock on this directory's state **without waiting** and returns the handle that holds it. A
+     * `VaultSession` holds it from open to close, so two sessions (two windows, an app and a background service,
+     * two instances in one process) can never edit the same vault concurrently and lose each other's edits.
+     *
+     * @throws VaultSessionException.DirectoryInUse when another session, process or store object holds it
+     * @throws LocalStateException when the lock file cannot be opened
+     */
+    fun lockDirectory(): DirectoryLock {
+        val channel = try {
+            if (!dir.isDirectory && !dir.mkdirs() && !dir.isDirectory) {
+                throw LocalStateException("The sync state directory cannot be created")
+            }
+            FileChannel.open(lockFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+        } catch (e: IOException) {
+            throw LocalStateException("The sync state lock cannot be opened", e)
+        }
+        val lock: FileLock? = try {
+            channel.tryLock()
+        } catch (e: OverlappingFileLockException) {
+            null // this JVM already holds it
+        } catch (e: IOException) {
+            runCatching { channel.close() }
+            throw LocalStateException("The sync state lock cannot be taken", e)
+        }
+        if (lock == null) {
+            runCatching { channel.close() }
+            throw VaultSessionException.DirectoryInUse(dir)
+        }
+        return DirectoryLock(channel, lock)
+    }
+
+    /** The OS-level directory lock; closing it releases the lock. */
+    class DirectoryLock internal constructor(private val channel: FileChannel, private val lock: FileLock) : AutoCloseable {
+        override fun close() {
             try {
-                val fileLock = acquire(channel)
-                try {
-                    block()
-                } finally {
-                    try {
-                        fileLock.release()
-                    } catch (e: IOException) {
-                        // The lock goes away when the channel is closed.
-                    }
-                }
-            } finally {
-                try {
-                    channel.close()
-                } catch (e: IOException) {
-                    // Nothing more to do.
-                }
+                lock.release()
+            } catch (e: IOException) {
+                // The lock goes away when the channel is closed.
+            }
+            try {
+                channel.close()
+            } catch (e: IOException) {
+                // Nothing more to do.
             }
         }
     }
 
     /**
-     * Deletes the stored state (an explicit user decision: it switches rollback protection off for a fresh start).
-     * Takes the same per-path mutex and file lock as [exclusive], so it cannot race a running sync; call it outside
-     * [exclusive].
+     * The explicit way to start rollback protection from scratch (a user decision: it switches the floors off).
+     * It **never deletes the vault**: the sealed local vault file, an unpublished password change and the device id
+     * are kept; the merge base, the floors, the file digests and the probe results are forgotten. Takes the same
+     * in-process mutex as [exclusive], so call it outside [exclusive], and without a `VaultSession` open on the
+     * directory.
+     *
+     * A state file that cannot be read is not touched unless [moveUnreadableAside] is set: then it (and the
+     * previous copy) is renamed to `<name>.unreadable-<time>` (never deleted, so `salvage` can still read it) and
+     * the state starts empty. Without the flag the call throws [LocalStateException]; try `VaultSession.salvage`
+     * first.
      */
-    suspend fun reset() {
+    suspend fun reset(moveUnreadableAside: Boolean = false) {
         exclusive {
             withContext(Dispatchers.IO) {
-                stateFile.delete()
-                tempFile.delete()
+                val current = try {
+                    readFromDisk()
+                } catch (e: LocalStateException) {
+                    if (!moveUnreadableAside) {
+                        throw LocalStateException(
+                            "The state file is unreadable: salvage it first, or reset with moveUnreadableAside", e,
+                        )
+                    }
+                    val suffix = ".unreadable-" + System.currentTimeMillis()
+                    for (f in listOf(stateFile, prevFile)) {
+                        if (f.exists()) Files.move(f.toPath(), File(f.path + suffix).toPath())
+                    }
+                    cached = LocalSyncState()
+                    stamp = null
+                    return@withContext
+                }
+                val kept = LocalSyncState(
+                    vaults = current.vaults
+                        .mapValues { (_, v) -> VaultSyncState(localFile = v.localFile, pendingLocalFile = v.pendingLocalFile) }
+                        .filterValues { it.localFile != null || it.pendingLocalFile != null },
+                    servers = emptyMap(),
+                    deviceId = current.deviceId,
+                )
+                writeToDisk(kept)
+                cached = kept
             }
-            cached = null
-        }
-    }
-
-    // ------------------------------------------------------------------ locking
-
-    private fun openLockChannel(): FileChannel {
-        try {
-            if (!dir.isDirectory && !dir.mkdirs() && !dir.isDirectory) {
-                throw LocalStateException("The sync state directory cannot be created")
-            }
-            return FileChannel.open(lockFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE)
-        } catch (e: IOException) {
-            throw LocalStateException("The sync state lock cannot be opened", e)
-        }
-    }
-
-    private suspend fun acquire(channel: FileChannel): FileLock {
-        val deadline = System.nanoTime() + LOCK_WAIT_NANOS
-        while (true) {
-            val lock: FileLock? = try {
-                withContext(Dispatchers.IO) { channel.tryLock() }
-            } catch (e: OverlappingFileLockException) {
-                null
-            } catch (e: IOException) {
-                throw LocalStateException("The sync state lock cannot be taken", e)
-            }
-            if (lock != null) return lock
-            if (System.nanoTime() > deadline) throw LocalStateException("The sync state is in use by another process")
-            delay(LOCK_POLL_MILLIS)
         }
     }
 
     // ------------------------------------------------------------------ reading
 
     private fun readFromDisk(): LocalSyncState {
-        if (!stateFile.exists()) return LocalSyncState()
+        if (!stateFile.exists()) {
+            if (prevFile.exists()) {
+                // Only the window between the two renames of a save (or a lost file) gets here: the previous copy is
+                // the last state that was ever acknowledged, so it is used instead of starting empty.
+                val state = readStrict(prevFile)
+                loadedFromPrevious = true
+                stamp = null
+                return state
+            }
+            loadedFromPrevious = false
+            stamp = null
+            return LocalSyncState()
+        }
+        val state = readStrict(stateFile) // a damaged current file is never replaced silently by the previous copy
+        loadedFromPrevious = false
+        stamp = statFile()
+        return state
+    }
+
+    private fun readStrict(file: File): LocalSyncState {
         try {
-            if (stateFile.length() > MAX_STATE_BYTES) throw LocalStateException("The sync state file is too large")
-            val bytes = stateFile.readBytes()
+            if (file.length() > MAX_STATE_BYTES) throw LocalStateException("The sync state file is too large")
+            val bytes = file.readBytes()
             val prefix = MAGIC.size + 1 + DIGEST_BYTES
             if (bytes.size < prefix || !bytes.copyOfRange(0, MAGIC.size).contentEquals(MAGIC) || bytes[MAGIC.size] != VERSION) {
                 throw LocalStateException("The sync state file is not valid")
@@ -176,6 +255,43 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
         }
     }
 
+    /** A state read for recovery. [checksumOk] is false for a file whose payload still decodes although its checksum fails. */
+    class SalvagedState(val source: SalvageSource, val state: LocalSyncState, val checksumOk: Boolean)
+
+    /**
+     * Every state that can still be read from the state file and from the rolling previous copy, newest first, for
+     * recovery. The checksum is **not** required (a file damaged outside the part that matters may still decode:
+     * the vault inside is self-authenticating, so the checksum protects the floors, not the vault). Reads only;
+     * nothing is changed, replaced or deleted.
+     */
+    fun salvageCandidates(): List<SalvagedState> {
+        val out = ArrayList<SalvagedState>()
+        for ((file, strictSource, lenientSource) in listOf(
+            Triple(stateFile, SalvageSource.Current, SalvageSource.CurrentIgnoringChecksum),
+            Triple(prevFile, SalvageSource.Previous, SalvageSource.PreviousIgnoringChecksum),
+        )) {
+            if (!file.exists()) continue
+            val parsed = readLenient(file) ?: continue
+            out += SalvagedState(if (parsed.second) strictSource else lenientSource, parsed.first, parsed.second)
+        }
+        return out
+    }
+
+    private fun readLenient(file: File): Pair<LocalSyncState, Boolean>? {
+        try {
+            if (file.length() > MAX_STATE_BYTES) return null
+            val bytes = file.readBytes()
+            val prefix = MAGIC.size + 1 + DIGEST_BYTES
+            if (bytes.size < prefix || !bytes.copyOfRange(0, MAGIC.size).contentEquals(MAGIC) || bytes[MAGIC.size] != VERSION) return null
+            val digest = bytes.copyOfRange(MAGIC.size + 1, prefix)
+            val payload = bytes.copyOfRange(prefix, bytes.size)
+            val ok = MessageDigest.isEqual(digest, MessageDigest.getInstance("SHA-256").digest(payload))
+            return decode(payload.decodeToString()) to ok
+        } catch (e: Exception) {
+            return null
+        }
+    }
+
     private fun decode(text: String): LocalSyncState {
         val root = Json.parseToJsonElement(text).jsonObject
         val vaults = LinkedHashMap<String, VaultSyncState>()
@@ -183,6 +299,10 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
             val o = element.jsonObject
             val base = o["base"]?.jsonPrimitive?.content?.let { Base64.Default.decode(it) }
             val localFile = o["local"]?.jsonPrimitive?.content?.let { Base64.Default.decode(it) }
+            val pending = o["pending"]?.jsonPrimitive?.content?.let { Base64.Default.decode(it) }
+            val chain = o["chain"]?.jsonObject?.let {
+                ChainWarning(it.getValue("from").jsonPrimitive.long, it.getValue("to").jsonPrimitive.long)
+            }
             val digests = LinkedHashMap<Long, String>()
             for ((revision, digest) in o.getValue("digests").jsonObject) {
                 digests[revision.toLong()] = digest.jsonPrimitive.content
@@ -192,10 +312,11 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
                 localFile = localFile,
                 highestRevision = o.getValue("revision").jsonPrimitive.long,
                 highestKeyEpoch = o.getValue("keyEpoch").jsonPrimitive.long,
-                highestHeaderRevision = o.getValue("headerRevision").jsonPrimitive.long,
                 fileDigests = digests,
+                pendingLocalFile = pending,
+                chainWarning = chain,
             )
-            if (state.highestRevision < 0 || state.highestKeyEpoch < 0 || state.highestHeaderRevision < 0) {
+            if (state.highestRevision < 0 || state.highestKeyEpoch < 0) {
                 throw LocalStateException("The sync state file holds invalid numbers")
             }
             vaults[id] = state
@@ -234,7 +355,10 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
             if (localFile != null) o["local"] = JsonPrimitive(Base64.Default.encode(localFile))
             o["revision"] = JsonPrimitive(v.highestRevision)
             o["keyEpoch"] = JsonPrimitive(v.highestKeyEpoch)
-            o["headerRevision"] = JsonPrimitive(v.highestHeaderRevision)
+            v.pendingLocalFile?.let { o["pending"] = JsonPrimitive(Base64.Default.encode(it)) }
+            v.chainWarning?.let {
+                o["chain"] = JsonObject(mapOf("from" to JsonPrimitive(it.fromEpoch), "to" to JsonPrimitive(it.toEpoch)))
+            }
             val digests = LinkedHashMap<String, JsonElement>()
             for ((revision, digest) in v.fileDigests) digests[revision.toString()] = JsonPrimitive(digest)
             o["digests"] = JsonObject(digests)
@@ -283,16 +407,44 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
                 out.fd.sync()
             }
             beforeRenameHook?.invoke()
-            try {
-                Files.move(tempFile.toPath(), stateFile.toPath(), StandardCopyOption.ATOMIC_MOVE)
-            } catch (e: AtomicMoveNotSupportedException) {
-                throw LocalStateException("This file system cannot replace the sync state atomically", e)
-            }
+            // Rolling previous copy: the current file becomes .prev first (only .prev exists between the two renames).
+            if (stateFile.exists()) moveReplacing(stateFile, prevFile)
+            betweenRenamesHook?.invoke()
+            moveReplacing(tempFile, stateFile)
             syncDirectory()
+            stamp = statFile()
+            loadedFromPrevious = false
         } catch (e: LocalStateException) {
             throw e
         } catch (e: IOException) {
             throw LocalStateException("The sync state cannot be written", e)
+        }
+    }
+
+    /**
+     * Renames [source] over [target]: an atomic move; on a sharing violation (Windows, a scanner holding the target
+     * open without `FILE_SHARE_DELETE`) or any other failure it retries a few times over about a second, and as a
+     * last resort replaces non-atomically. The fallback is safe because the previous copy is already in place.
+     */
+    private fun moveReplacing(source: File, target: File) {
+        var lastFailure: IOException? = null
+        for (attempt in 1..MOVE_ATTEMPTS) {
+            try {
+                Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+                return
+            } catch (e: AtomicMoveNotSupportedException) {
+                lastFailure = e
+                break // retrying cannot help: go to the plain replace
+            } catch (e: IOException) {
+                lastFailure = e
+                if (attempt < MOVE_ATTEMPTS) Thread.sleep(MOVE_RETRY_MILLIS)
+            }
+        }
+        try {
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        } catch (e: IOException) {
+            e.addSuppressed(lastFailure ?: e)
+            throw LocalStateException("The sync state cannot be replaced", e)
         }
     }
 
@@ -313,8 +465,8 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
         private const val VERSION: Byte = 1
         private const val DIGEST_BYTES = 32
         private const val MAX_STATE_BYTES = 64L * 1024 * 1024
-        private const val LOCK_WAIT_NANOS = 30_000_000_000L
-        private const val LOCK_POLL_MILLIS = 100L
+        private const val MOVE_ATTEMPTS = 5
+        private const val MOVE_RETRY_MILLIS = 250L
         private val mutexes = ConcurrentHashMap<String, Mutex>()
     }
 }

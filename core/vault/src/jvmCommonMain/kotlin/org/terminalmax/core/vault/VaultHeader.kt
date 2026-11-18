@@ -26,6 +26,10 @@ internal data class KeySlot(
 )
 
 /**
+ * The header of a vault file. **It is immutable within a key epoch**: every change to the slot (a new password, new
+ * KDF parameters) is a rotation to the next epoch with a fresh data key, so two files of the same vault, key epoch
+ * and key never differ in anything but [writeSalt].
+ *
  * @property keyCommit commitment to the data key of [keyEpoch] (base64, 32 bytes); every open verifies it
  * @property epochLink for [keyEpoch] >= 2: HMAC-SHA-256 under a key derived from the previous epoch's data key,
  *   proving that whoever wrote this epoch held the previous key (base64, 32 bytes); null for epoch 1
@@ -35,25 +39,26 @@ internal data class VaultHeader(
     val kdf: String = "argon2id",
     val vaultId: String,
     val keyEpoch: Long,
-    val headerRevision: Long,
     val slots: List<KeySlot>,
     val writeSalt: String,
     val keyCommit: String,
     val epochLink: String? = null,
 )
 
+/** True when [other] differs from this header in nothing but the write salt (the one field every seal renews). */
+internal fun VaultHeader.sameKeyingAs(other: VaultHeader): Boolean = copy(writeSalt = "") == other.copy(writeSalt = "")
+
 /** Public description of a key slot. */
 data class SlotInfo(val id: String, val type: String)
 
 /**
  * The structural facts of a vault file's header. Obtained from [VaultCodec.inspect] **without any cryptography**,
- * so nothing here is authenticated; use it only to choose which key to try. [OpenVault.keyEpoch] and
- * [OpenVault.headerRevision] of an opened vault are the authenticated values.
+ * so nothing here is authenticated; use it only to choose which key to try. [OpenVault.keyEpoch] of an opened
+ * vault is the authenticated value.
  */
 data class HeaderInfo(
     val vaultId: String,
     val keyEpoch: Long,
-    val headerRevision: Long,
     val slots: List<SlotInfo>,
 )
 

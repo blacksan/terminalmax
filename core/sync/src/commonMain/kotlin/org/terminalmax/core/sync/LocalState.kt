@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package org.terminalmax.core.sync
 
+import org.terminalmax.core.vault.VaultContent
+
 /** The local sync state cannot be read, is corrupt, or cannot be written. Sync fails closed instead of resetting it. */
 class LocalStateException(message: String, cause: Throwable? = null) : Exception(message, cause)
+
+/**
+ * A re-key that this device adopted but could not verify, remembered until the user acknowledges it
+ * (`VaultSession.acknowledgeKeyEpochWarning`). [fromEpoch] == [toEpoch] means a competing key at the same epoch.
+ */
+data class ChainWarning(val fromEpoch: Long, val toEpoch: Long)
 
 /**
  * What a device remembers about one vault between syncs. It holds no secrets: [baseFile] is the encrypted file
@@ -15,9 +23,12 @@ class LocalStateException(message: String, cause: Throwable? = null) : Exception
  * @property baseFile the vault file as of the last successful sync, or null
  * @property localFile this device's own sealed vault file (its current local content), or null when the state is
  *   used without a `VaultSession`
+ * @property pendingLocalFile the fully sealed **new-epoch** local file of a password change that is being
+ *   published: written durably before the upload, cleared once the change is committed (or known not to have
+ *   happened). After a crash it is what lets the new password open the vault (see `VaultSession.open`).
+ * @property chainWarning a key epoch change this device adopted without being able to verify its chain, until acknowledged
  * @property highestRevision highest content revision ever read from or written to the remote
  * @property highestKeyEpoch highest key epoch seen
- * @property highestHeaderRevision highest slot-set revision seen
  * @property fileDigests SHA-256 hex of the files seen, by content revision, newest [MAX_DIGESTS] only; a different
  *   file at an already seen revision is a fork
  */
@@ -26,8 +37,9 @@ data class VaultSyncState(
     val localFile: ByteArray? = null,
     val highestRevision: Long = 0L,
     val highestKeyEpoch: Long = 0L,
-    val highestHeaderRevision: Long = 0L,
     val fileDigests: Map<Long, String> = emptyMap(),
+    val pendingLocalFile: ByteArray? = null,
+    val chainWarning: ChainWarning? = null,
 ) {
     /** True once this device has synced the vault at least once (so a missing remote file is suspicious). */
     val established: Boolean get() = baseFile != null || highestRevision > 0L
@@ -37,10 +49,11 @@ data class VaultSyncState(
         if (other !is VaultSyncState) return false
         return highestRevision == other.highestRevision &&
             highestKeyEpoch == other.highestKeyEpoch &&
-            highestHeaderRevision == other.highestHeaderRevision &&
             fileDigests == other.fileDigests &&
+            chainWarning == other.chainWarning &&
             (baseFile?.contentEquals(other.baseFile) ?: (other.baseFile == null)) &&
-            (localFile?.contentEquals(other.localFile) ?: (other.localFile == null))
+            (localFile?.contentEquals(other.localFile) ?: (other.localFile == null)) &&
+            (pendingLocalFile?.contentEquals(other.pendingLocalFile) ?: (other.pendingLocalFile == null))
     }
 
     override fun hashCode(): Int {
@@ -48,14 +61,15 @@ data class VaultSyncState(
         result = 31 * result + (localFile?.contentHashCode() ?: 0)
         result = 31 * result + highestRevision.hashCode()
         result = 31 * result + highestKeyEpoch.hashCode()
-        result = 31 * result + highestHeaderRevision.hashCode()
+        result = 31 * result + (pendingLocalFile?.contentHashCode() ?: 0)
+        result = 31 * result + (chainWarning?.hashCode() ?: 0)
         result = 31 * result + fileDigests.hashCode()
         return result
     }
 
     override fun toString(): String =
         "VaultSyncState(base=${baseFile?.size ?: 0} bytes, revision=$highestRevision, keyEpoch=$highestKeyEpoch, " +
-            "headerRevision=$highestHeaderRevision, digests=${fileDigests.size})"
+            "pending=${pendingLocalFile != null}, digests=${fileDigests.size})"
 
     companion object {
         const val MAX_DIGESTS: Int = 64
@@ -96,10 +110,27 @@ interface LocalStateStore {
     suspend fun save(state: LocalSyncState)
 
     /**
-     * Runs [block] while no other [SyncEngine] (in this or another process) uses the same state. The default does
-     * nothing; the file-backed store implements it with a file lock.
+     * Runs [block] while nothing else in this process loads-modifies-saves the same state: it is a **short**
+     * critical section around one read-modify-write of the state and must never contain network I/O. It is not
+     * re-entrant. The default does nothing; the file-backed store implements it with a per-path mutex. Exclusion
+     * from *other processes* is not part of it: `VaultSession` holds an OS-level lock on the directory for its
+     * whole lifetime (see `FileLocalStateStore.lockDirectory`).
      */
     suspend fun <T> exclusive(block: suspend () -> T): T = block()
+}
+
+/**
+ * How the engine sees the caller's live local content, so that network I/O can run on a snapshot without blocking
+ * edits. At commit time (inside [LocalStateStore.exclusive]) the engine asks for the content as it is **now**; if
+ * edits were made since the snapshot it commits the join of the synced result and those edits and reports
+ * [SyncResult.localEditsPending]. `VaultSession` implements this over its content flow.
+ */
+interface LocalView {
+    /** The content as it is now, including every committed edit. */
+    suspend fun current(): VaultContent
+
+    /** The content that was just committed as the local vault (called inside the state section). */
+    fun committed(content: VaultContent)
 }
 
 /**

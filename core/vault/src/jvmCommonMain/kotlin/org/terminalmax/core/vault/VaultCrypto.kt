@@ -74,12 +74,17 @@ internal object VaultCrypto {
         }
     }
 
-    /** Argon2id (version 0x13), 32-byte output. [params] must already be validated. */
+    /**
+     * Argon2id (version 0x13), 32-byte output. [params] must already be validated. The implementation is pure JVM
+     * and allocates its whole matrix up front, so an `OutOfMemoryError` is a real possibility on a small device: it
+     * is reported as [VaultException.KdfCostTooHigh] instead of killing the app.
+     */
     fun argon2id(password: CharArray, salt: ByteArray, params: KdfParams): ByteArray {
         params.validate()
-        kdfObserver?.invoke(params)
-        val passwordBytes = encodePassword(password)
+        var passwordBytes: ByteArray? = null
         try {
+            kdfObserver?.invoke(params)
+            passwordBytes = encodePassword(password)
             val argon = Argon2Parameters.Builder(Argon2Parameters.ARGON2_id)
                 .withVersion(Argon2Parameters.ARGON2_VERSION_13)
                 .withIterations(params.iterations)
@@ -92,9 +97,40 @@ internal object VaultCrypto {
             val out = ByteArray(KEY_BYTES)
             generator.generateBytes(passwordBytes, out, 0, out.size)
             return out
+        } catch (e: OutOfMemoryError) {
+            throw VaultException.KdfCostTooHigh("not enough memory for the key derivation (${params.memoryKiB / 1024} MiB)")
         } finally {
-            passwordBytes.fill(0)
+            passwordBytes?.fill(0)
         }
+    }
+
+    /**
+     * Argon2id with every parameter of RFC 9106 (secret and associated data, any output length). **Test hook** for
+     * the RFC 9106 known-answer vector; the vault format itself never uses a secret or associated data.
+     */
+    internal fun argon2idRaw(
+        password: ByteArray,
+        salt: ByteArray,
+        secret: ByteArray?,
+        associatedData: ByteArray?,
+        iterations: Int,
+        memoryKiB: Int,
+        parallelism: Int,
+        outputLength: Int,
+    ): ByteArray {
+        val builder = Argon2Parameters.Builder(Argon2Parameters.ARGON2_id)
+            .withVersion(Argon2Parameters.ARGON2_VERSION_13)
+            .withIterations(iterations)
+            .withMemoryAsKB(memoryKiB)
+            .withParallelism(parallelism)
+            .withSalt(salt)
+        if (secret != null) builder.withSecret(secret)
+        if (associatedData != null) builder.withAdditional(associatedData)
+        val generator = Argon2BytesGenerator()
+        generator.init(builder.build())
+        val out = ByteArray(outputLength)
+        generator.generateBytes(password, out, 0, out.size)
+        return out
     }
 
     /** HKDF-SHA-256 (RFC 5869). */

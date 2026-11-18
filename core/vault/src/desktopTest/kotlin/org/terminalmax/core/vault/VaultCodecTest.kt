@@ -107,7 +107,6 @@ class VaultCodecTest {
         assertEquals(vault.content, opened.content)
         assertEquals(vault.vaultId, opened.vaultId)
         assertEquals(1L, opened.keyEpoch)
-        assertEquals(1L, opened.headerRevision)
         assertEquals(3, opened.content.records.size)
         opened.close()
         vault.close()
@@ -118,7 +117,6 @@ class VaultCodecTest {
         val bytes = VaultCodec.seal(sampleVault())
         val info = VaultCodec.inspect(bytes)
         assertEquals(1L, info.keyEpoch)
-        assertEquals(1L, info.headerRevision)
         assertEquals(listOf(SlotTypes.PASSWORD), info.slots.map { it.type })
     }
 
@@ -133,7 +131,8 @@ class VaultCodecTest {
 
     @Test
     fun slotIdsAreOpaqueRandomIds() {
-        val v = VaultCodec.addPasswordSlot(sampleVault(), pw("second"), fast)
+        val v = sampleVault()
+        assertEquals(1, v.slotIds.size)
         assertTrue(v.slotIds.all { Regex("pw-[0-9a-f]{16}").matches(it) }, v.slotIds.toString())
     }
 
@@ -239,8 +238,8 @@ class VaultCodecTest {
         val bytes = VaultCodec.seal(sampleVault())
         val flipped = bytes.copyOf().also { it[it.size - 1] = (it[it.size - 1].toInt() xor 1).toByte() }
         assertFailsWith<VaultException.IntegrityFailure> { VaultCodec.open(flipped, pw()) }
-        // A header edit that keeps the slots intact (header revision) breaks the content tag, not the slot.
-        val edited = withHeader(bytes) { it.replace("\"headerRevision\":1", "\"headerRevision\":2") }
+        // A header edit that keeps the slot intact (here: insignificant whitespace) breaks the content tag, not the slot.
+        val edited = withHeader(bytes) { it.replace("\"kdf\":\"argon2id\",", "\"kdf\": \"argon2id\",") }
         assertFailsWith<VaultException.IntegrityFailure> { VaultCodec.open(edited, pw()) }
         // The key epoch is bound into the slot AAD as well.
         val epoch = withHeader(bytes) { it.replace("\"keyEpoch\":1", "\"keyEpoch\":2") }
@@ -288,7 +287,6 @@ class VaultCodecTest {
         val oldFile = VaultCodec.seal(original)
         val changed = VaultCodec.changePassword(original, pw("new password"))
         assertEquals(original.keyEpoch + 1, changed.keyEpoch)
-        assertEquals(original.headerRevision + 1, changed.headerRevision)
         assertFalse(original.dataKey().contentEquals(changed.dataKey()), "data key must change")
         assertEquals(original.slotIds, changed.slotIds)
 
@@ -302,7 +300,7 @@ class VaultCodecTest {
         assertEquals(1L, mismatch.expected)
         // ... and cannot decrypt even when pretending to be at the new epoch.
         val oldKeyNewEpoch = OpenVault(changed.content, changed.header, original.dataKey().copyOf())
-        assertFailsWith<VaultException.BadPasswordOrCorrupt> { VaultCodec.openWithDataKey(newFile, oldKeyNewEpoch) }
+        assertFailsWith<VaultException.KeyMismatchSameEpoch> { VaultCodec.openWithDataKey(newFile, oldKeyNewEpoch) }
         assertEquals(EpochLinkStatus.Verified, VaultCodec.verifyEpochLink(newFile, original))
         // The old file still opens with the old password (history cannot be rewritten) but is older by epoch.
         assertEquals(1L, VaultCodec.open(oldFile, pw()).keyEpoch)
@@ -361,26 +359,28 @@ class VaultCodecTest {
     }
 
     @Test
-    fun tooManyPasswordSlotsAreRejectedBeforeAnyKeyDerivation() {
+    fun aVaultHasExactlyOnePasswordSlotAndAnythingElseIsRejectedBeforeAnyKeyDerivation() {
         val bytes = VaultCodec.seal(sampleVault())
+        val otherVault = sampleVault()
         val derivations = AtomicInteger()
         VaultCrypto.kdfObserver = { derivations.incrementAndGet() }
-        // 1 genuine + 15 attacker slots at the maximum the format allows.
+        // 1 genuine + 15 attacker slots at the maximum the format allows, then just one slot too many.
         val hostile = withHeader(bytes) { header ->
             addPasswordSlots(header, 15).replace("\"memoryKiB\":8192", "\"memoryKiB\":1048576")
                 .replace("\"iterations\":1", "\"iterations\":10")
         }
         val started = System.nanoTime()
-        assertFailsWith<VaultException.KdfCostTooHigh> { VaultCodec.open(hostile, pw()) }
+        assertFailsWith<VaultException.InvalidFormat> { VaultCodec.open(hostile, pw()) }
         assertTrue(System.nanoTime() - started < 2_000_000_000L, "rejection must be immediate")
-        // Also just one slot too many with otherwise harmless parameters.
-        val three = withHeader(bytes) { addPasswordSlots(it, 2) }
-        assertFailsWith<VaultException.KdfCostTooHigh> { VaultCodec.open(three, pw()) }
-        assertEquals(0, derivations.get(), "a key derivation ran for a rejected header")
-        // Two slots are within the limit.
         val two = withHeader(bytes) { addPasswordSlots(it, 1) }
-        assertFailsWith<VaultException.BadPasswordOrCorrupt> { VaultCodec.open(two, pw("wrong")) }
-        assertEquals(2, derivations.get())
+        assertFailsWith<VaultException.InvalidFormat> { VaultCodec.open(two, pw()) }
+        assertFailsWith<VaultException.InvalidFormat> { VaultCodec.inspect(two) }
+        assertFailsWith<VaultException.InvalidFormat> { VaultCodec.openWithDataKey(two, otherVault) }
+        // No slot at all is no vault either.
+        val none = withHeader(bytes) { it.replace(passwordSlotJson, "").replace("[,", "[").replace(",]", "]") }
+        assertFailsWith<VaultException> { VaultCodec.open(none, pw()) }
+        assertEquals(0, derivations.get(), "a key derivation ran for a rejected header")
+        assertEquals(1, VaultCodec.MAX_PASSWORD_SLOTS)
     }
 
     @Test
@@ -392,31 +392,12 @@ class VaultCodecTest {
         assertFailsWith<VaultException.KdfCostTooHigh> { VaultCodec.open(aboveCeiling, pw()) }
         // A lower ceiling chosen by the caller (a small device) applies as well.
         assertFailsWith<VaultException.KdfCostTooHigh> { VaultCodec.open(bytes, pw(), memoryCeilingKiB = 8 * 1024 - 1) }
-        // Two slots of 64 MiB at 10 passes: each within the ceiling, together over the budget.
+        // One slot of exactly the ceiling at 10 passes: within the memory ceiling, over the cost budget.
         val overBudget = withHeader(bytes) {
-            addPasswordSlots(it, 1).replace("\"memoryKiB\":8192", "\"memoryKiB\":65536")
-                .replace("\"iterations\":1", "\"iterations\":10")
+            it.replace("\"memoryKiB\":8192", "\"memoryKiB\":${128 * 1024}").replace("\"iterations\":1", "\"iterations\":10")
         }
         assertFailsWith<VaultException.KdfCostTooHigh> { VaultCodec.open(overBudget, pw()) }
         assertEquals(0, derivations.get())
-    }
-
-    @Test
-    fun theRememberedPasswordSlotIsTriedFirst() {
-        var vault = sampleVault()
-        vault = VaultCodec.addPasswordSlot(vault, pw("second"), fast)
-        val second = vault.slots.last { it.type == SlotTypes.PASSWORD }.id
-        val bytes = VaultCodec.seal(vault)
-        val derivations = AtomicInteger()
-        VaultCrypto.kdfObserver = { derivations.incrementAndGet() }
-        VaultCodec.open(bytes, pw("second")).close()
-        assertEquals(2, derivations.get(), "without a hint the slots are tried in file order")
-        derivations.set(0)
-        VaultCodec.open(bytes, pw("second"), preferredSlotId = second).close()
-        assertEquals(1, derivations.get(), "the preferred slot must be tried first")
-        assertFailsWith<IllegalArgumentException> {
-            VaultCodec.addPasswordSlot(vault, pw("third"), fast) // a third password slot is refused
-        }
     }
 
     // ------------------------------------------------------------------ content validation
@@ -562,7 +543,8 @@ class VaultCodecTest {
             { it.replace(Regex("\"nonce\":\"[^\"]*\""), "\"nonce\":\"!!!!\"") },
             { it.replace("\"keyEpoch\":1", "\"keyEpoch\":0") },
             { it.replace("\"keyEpoch\":1", "\"keyEpoch\":4294967296") },
-            { it.replace("\"headerRevision\":1", "\"headerRevision\":-1") },
+            { it.replace("\"keyEpoch\":1", "\"keyEpoch\":1,\"headerRevision\":1") }, // the field no longer exists
+            { it.replace("\"keyEpoch\":1", "\"keyEpoch\":1,\"headerRevision\":9007199254740991") },
             { it.replace(Regex("\"writeSalt\":\"[^\"]*\""), "\"writeSalt\":\"AAAA\"") },
         )
         for (transform in broken) {

@@ -36,9 +36,6 @@ sealed class VaultException(message: String, cause: Throwable? = null) : Excepti
     /** The key-derivation work a file asks for exceeds the platform ceiling or the per-file budget. */
     class KdfCostTooHigh(detail: String) : VaultException("Key derivation cost rejected: $detail")
 
-    /** The requested key slot does not exist. */
-    class NoSuchSlot : VaultException("No such key slot")
-
     /** Authentic (or locally produced) content that violates the content rules (bounds, duplicate ids, ...). */
     class InvalidContent(detail: String) : VaultException("Invalid vault content: $detail")
 
@@ -49,4 +46,20 @@ sealed class VaultException(message: String, cause: Throwable? = null) : Excepti
      */
     class KeyEpochMismatch(val found: Long, val expected: Long) :
         VaultException("Vault key epoch $found does not match the key epoch $expected in use")
+
+    /**
+     * A file of the **same vault, key epoch and key** as the one in use whose header differs from the one this device
+     * holds (another slot, other KDF parameters, another epoch link). Within one key epoch the header never changes
+     * (any change of the password slot is a rotation to the next epoch), so such a file was written by someone who
+     * holds the data key but is not following the format: a compromised device or a malicious co-user. It is refused
+     * outright: not merged, not adopted, nothing re-sealed.
+     */
+    class HeaderMismatchSameEpoch : VaultException("A file of the same key epoch carries a different header")
+
+    /**
+     * A file of the **same vault and key epoch** but under a different data key (the key commitment differs): two
+     * rotations to the same epoch raced, or someone minted a competing epoch. A password may open it (see
+     * `VaultCodecHooks.reopen`); the data key in use cannot.
+     */
+    class KeyMismatchSameEpoch : VaultException("A file of the same key epoch is under a different data key")
 }

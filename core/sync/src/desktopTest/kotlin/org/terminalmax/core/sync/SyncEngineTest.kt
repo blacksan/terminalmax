@@ -577,19 +577,19 @@ class SyncEngineTest {
     }
 
     @Test
-    fun aReplayedOldHeaderIsRejectedAndNotUploadedAgain() {
+    fun aReplayedOldEpochIsRejectedAndNotUploadedAgain() {
         val s = server()
         val (a, b) = twoDevices(s)
-        val old = vaultFile(s) // header revision 1
-        val staged = a.hooks.stage { VaultCodec.addPasswordSlot(it, "second".toCharArray(), fast) }
+        val old = vaultFile(s) // epoch 1
+        val staged = a.hooks.stage { VaultCodec.changePassword(it, "second".toCharArray()) }
         assertEquals(SyncOutcome.Pushed, a.syncResult(staged = staged).outcome, "a slot change is published as a transaction")
-        assertEquals(2L, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).headerRevision)
-        b.sync() // B learns header revision 2 (and adopts the new slot set)
-        assertEquals(2L, b.hooks.headerRevision)
+        assertEquals(2L, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).keyEpoch)
+        b.syncResult(password = "second".toCharArray()) // B learns epoch 2
+        assertEquals(2L, b.hooks.keyEpoch)
 
         s.files[FakeDavServer.VAULT] = old
         val puts = s.requests("PUT", FakeDavServer.VAULT).size
-        val outcome = b.sync(SyncOptions(allowRollback = true)) // the override never waives the header floor
+        val outcome = b.sync(SyncOptions(allowRollback = true)) // the override never waives the key-epoch floor
         assertEquals(FailureReason.RollbackDetected, failure(outcome))
         assertEquals(puts, s.requests("PUT", FakeDavServer.VAULT).size)
         assertTrue(old.contentEquals(s.files.getValue(FakeDavServer.VAULT)))
@@ -674,27 +674,90 @@ class SyncEngineTest {
     }
 
     @Test
-    fun aHeaderChangedRemotelyIsReportedAndConcurrentSlotChangesAreNotLost() {
+    fun aPasswordChangePreparedBeforeAnotherDevicesRotationIsRefusedAndNothingIsLost() {
         val s = server()
         val (a, b) = twoDevices(s)
-        val stagedA = a.hooks.stage { VaultCodec.addPasswordSlot(it, "slot A".toCharArray(), fast) }
+        val stagedA = a.hooks.stage { VaultCodec.changePassword(it, "slot A".toCharArray()) }
         val stagedB = b.hooks.stage { VaultCodec.changePassword(it, "slot B".toCharArray()) }
         assertEquals(SyncOutcome.Pushed, a.syncResult(staged = stagedA).outcome)
-        // B prepared its change against header revision 1; the remote is at 2 now.
-        val refused = b.syncResult(staged = stagedB)
-        assertEquals(FailureReason.HeaderChangedRemotely, failure(refused.outcome))
+        // B prepared its change against epoch 1; the remote is at 2 now.
+        val refused = b.syncResult(staged = stagedB, password = "slot A".toCharArray())
+        assertTrue(refused.outcome is SyncOutcome.Failed, "${refused.outcome}")
         stagedB.discard()
-        assertEquals(1L, b.hooks.keyEpoch)
-        // Remote still carries A's slot; re-applying on top of it works.
-        b.sync()
-        val reapplied = b.hooks.stage { v ->
-            val ids = v.slotIds
-            VaultCodec.changePassword(
-                v, "slot B".toCharArray(), slotId = ids[0], otherPasswords = mapOf(ids[1] to "slot A".toCharArray()),
-            )
-        }
+        assertTrue(b.hooks.keyEpoch <= 2L)
+        // The remote is still A's rotation, readable with A's password.
+        assertEquals(2L, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).keyEpoch)
+        assertEquals(setOf("h1"), records(remoteContent(s, "slot A")).keys)
+        // Re-applying on top of it works.
+        b.syncResult(password = "slot A".toCharArray())
+        val reapplied = b.hooks.stage { VaultCodec.changePassword(it, "slot B".toCharArray()) }
         assertEquals(SyncOutcome.Pushed, b.syncResult(staged = reapplied).outcome)
-        assertEquals(2, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).slots.size)
+        assertEquals(3L, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).keyEpoch)
+    }
+
+    // ------------------------------------------------------------------ hostile files (T-B1)
+
+    private fun hostileSetup(): Triple<FakeDavServer, Device, Device> {
+        val s = server()
+        val (a, b) = twoDevices(s)
+        return Triple(s, a, b)
+    }
+
+    private fun assertRefusedAndUntouched(s: FakeDavServer, victim: Device, forged: ByteArray, expected: FailureReason) {
+        s.files[FakeDavServer.VAULT] = forged
+        val puts = s.requests("PUT", FakeDavServer.VAULT).size
+        val before = victim.content
+        val outcome = victim.sync()
+        assertEquals(expected, failure(outcome), "$outcome")
+        assertEquals(puts, s.requests("PUT", FakeDavServer.VAULT).size, "a refused file is never overwritten")
+        assertEquals(before, victim.content)
+        assertTrue(forged.contentEquals(s.files.getValue(FakeDavServer.VAULT)))
+    }
+
+    @Test
+    fun aSubstitutedPasswordSlotUnderTheHeldKeyIsRefusedByEveryDevice() {
+        val (s, a, b) = hostileSetup()
+        val key = HostileFiles.keyOf(a.vault.exportLocalUnlockSecret())
+        val genuine = vaultFile(s)
+        val attackerSlot = HostileFiles.slotOf(VaultCodec.seal(VaultCodec.create("evil".toCharArray(), fast)))
+        val forged = HostileFiles.forge(genuine, key) {
+            it.replace(Regex("\\{\"id\":\"pw-[0-9a-f]{16}\",\"type\":\"password\"[^{}]*\\}"), attackerSlot)
+        }
+        assertRefusedAndUntouched(s, b, forged, FailureReason.HeaderMismatchSameEpoch)
+        // The device is not stuck: the genuine file is accepted again, and the password still changes.
+        s.files[FakeDavServer.VAULT] = genuine
+        assertFalse(b.sync() is SyncOutcome.Failed)
+        val staged = b.hooks.stage { VaultCodec.changePassword(it, "next".toCharArray()) }
+        assertEquals(SyncOutcome.Pushed, b.syncResult(staged = staged).outcome)
+    }
+
+    @Test
+    fun aSecondPasswordSlotAddedUnderTheHeldKeyIsAnInvalidFile() {
+        val (s, a, b) = hostileSetup()
+        val key = HostileFiles.keyOf(a.vault.exportLocalUnlockSecret())
+        val genuine = vaultFile(s)
+        val slot = HostileFiles.slotOf(genuine)
+        val extra = slot.replace(Regex("pw-[0-9a-f]{16}"), "pw-ffffffffffffffff")
+        val forged = HostileFiles.forge(genuine, key) { it.replace(slot, "$slot,$extra") }
+        s.files[FakeDavServer.VAULT] = forged
+        val outcome = b.sync()
+        assertTrue(outcome is SyncOutcome.Failed, "$outcome")
+        assertTrue(failure(outcome) in setOf(FailureReason.InvalidRemoteFile, FailureReason.BadPasswordOrCorrupt, FailureReason.IntegrityFailure), "$outcome")
+        assertTrue(forged.contentEquals(s.files.getValue(FakeDavServer.VAULT)))
+    }
+
+    @Test
+    fun anInflatedHeaderRevisionFieldIsAnInvalidFileNotAFloor() {
+        val (s, a, b) = hostileSetup()
+        val key = HostileFiles.keyOf(a.vault.exportLocalUnlockSecret())
+        val genuine = vaultFile(s)
+        val forged = HostileFiles.forge(genuine, key) { it.replace("\"keyEpoch\":1", "\"keyEpoch\":1,\"headerRevision\":9007199254740000") }
+        s.files[FakeDavServer.VAULT] = forged
+        val outcome = b.sync()
+        assertTrue(outcome is SyncOutcome.Failed, "$outcome")
+        // The genuine file is still accepted afterwards: no floor was poisoned.
+        s.files[FakeDavServer.VAULT] = genuine
+        assertFalse(b.sync() is SyncOutcome.Failed)
     }
 
     @Test
@@ -728,6 +791,70 @@ class SyncEngineTest {
         // A jump within the bound is accepted.
         s.files[FakeDavServer.VAULT] = withRevision(b, floor + MAX_REVISION_JUMP)
         assertFalse(a.sync() is SyncOutcome.Failed)
+    }
+
+    @Test
+    fun acceptRevisionJumpAcceptsAFarJumpAndReportsItButNeverAnImpossibleRevision() {
+        val s = server()
+        val (a, b) = twoDevices(s)
+        val floor = a.content.revision
+        s.files[FakeDavServer.VAULT] = withRevision(b, floor + MAX_REVISION_JUMP + 1)
+        assertEquals(FailureReason.SuspiciousRevisionJump, failure(a.sync()))
+        val accepted = a.syncResult(SyncOptions(acceptRevisionJump = true))
+        assertFalse(accepted.outcome is SyncOutcome.Failed, "${accepted.outcome}")
+        assertTrue(accepted.warnings.any { it is SyncWarning.RevisionJumpAccepted && it.floor == floor })
+
+        // A revision at the format limit stays refused whatever the option says.
+        val (s2, _, b2) = hostileSetup()
+        val fresh = Device("F", s2, VaultCodec.open(vaultFile(s2), "pw".toCharArray()))
+        s2.files[FakeDavServer.VAULT] = withRevision(b2, MAX_REVISION - 1)
+        val outcome = fresh.sync(SyncOptions(acceptRevisionJump = true))
+        assertTrue(outcome is SyncOutcome.Failed, "$outcome")
+    }
+
+    @Test
+    fun aSameEpochFileUnderAnotherKeyIsOnlyOpenedByThePasswordAndIsReported() {
+        val s = server()
+        val (a, b) = twoDevices(s)
+        // Two devices created the same vault id independently: same epoch, different keys.
+        val rival = VaultCodec.create("rival".toCharArray(), fast, vaultId = a.content.vaultId)
+        s.files[FakeDavServer.VAULT] = VaultCodec.seal(rival.withContent(a.content.copy(revision = a.content.revision + 1)))
+        val puts = s.requests("PUT", FakeDavServer.VAULT).size
+        val asked = b.syncResult()
+        assertEquals(FailureReason.ReopenRequired, failure(asked.outcome))
+        assertEquals(puts, s.requests("PUT", FakeDavServer.VAULT).size)
+        assertEquals(FailureReason.BadPasswordOrCorrupt, failure(b.syncResult(password = "pw".toCharArray()).outcome))
+        val opened = b.syncResult(password = "rival".toCharArray())
+        assertFalse(opened.outcome is SyncOutcome.Failed, "${opened.outcome}")
+        assertTrue(opened.warnings.any { it is SyncWarning.ConcurrentRekeyAdopted && it.epoch == 1L }, "${opened.warnings}")
+    }
+
+    @Test
+    fun aKeyEpochWarningIsRepeatedByEverySyncEvenWhenItFails() {
+        val s = server()
+        val (a, b) = twoDevices(s)
+        val attackerRoot = VaultCodec.create("evil".toCharArray(), fast, vaultId = a.content.vaultId)
+        val attacker = VaultCodec.changePassword(attackerRoot, "evil2".toCharArray())
+        s.files[FakeDavServer.VAULT] = VaultCodec.seal(attacker.withContent(a.content.copy(revision = a.content.revision + 1)))
+        assertTrue(b.syncResult(password = "evil2".toCharArray()).warnings.any { it is SyncWarning.KeyEpochChainUnverified })
+        // A later sync that fails for another reason still carries the warning.
+        s.files.remove(FakeDavServer.VAULT)
+        val failed = b.syncResult()
+        assertEquals(FailureReason.RemoteMissing, failure(failed.outcome))
+        assertTrue(failed.warnings.any { it is SyncWarning.KeyEpochChainUnverified }, "${failed.warnings}")
+    }
+
+    @Test
+    fun theSealedPendingRotationIsWrittenBeforeTheUploadAndClearedWhenItIsRefused() {
+        val s = server()
+        val (a, _) = twoDevices(s)
+        var pendingAtPut: ByteArray? = null
+        s.beforeNextPut = { pendingAtPut = runBlocking { a.state.load() }.vaults.values.single().pendingLocalFile }
+        val staged = a.hooks.stage { VaultCodec.changePassword(it, "new".toCharArray()) }
+        assertEquals(SyncOutcome.Pushed, a.syncResult(staged = staged).outcome)
+        assertEquals(2L, VaultCodec.inspect(checkNotNull(pendingAtPut) { "no pending rotation was written before the PUT" }).keyEpoch)
+        assertEquals(null, runBlocking { a.state.load() }.vaults.values.single().pendingLocalFile, "cleared once committed")
+        assertEquals(2L, VaultCodec.inspect(runBlocking { a.state.load() }.vaults.values.single().localFile!!).keyEpoch)
     }
 
     @Test
