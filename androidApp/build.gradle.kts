@@ -2,6 +2,42 @@ plugins {
     id("terminalmax.android.application")
 }
 
+// Copies the licence and the third-party notices (repository root) into a generated assets directory,
+// so that they are inside the APK as assets/LICENSE and assets/THIRD_PARTY_NOTICES.md. This uses AGP's
+// generated-source API (a task with an @OutputDirectory, registered per variant): it is configuration
+// cache safe, carries the task dependency into mergeAssets/lint automatically, needs no git-ignored
+// directory under src/ and no `dependsOn` wiring by name.
+abstract class GenerateLegalAssets : DefaultTask() {
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    abstract val legalFiles: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @TaskAction
+    fun generate() {
+        val out = outputDir.get().asFile
+        out.deleteRecursively()
+        out.mkdirs()
+        legalFiles.files.forEach { it.copyTo(File(out, it.name), overwrite = true) }
+    }
+}
+
+val generateLegalAssets = tasks.register<GenerateLegalAssets>("generateLegalAssets") {
+    legalFiles.from(
+        rootProject.layout.projectDirectory.file("LICENSE"),
+        rootProject.layout.projectDirectory.file("THIRD_PARTY_NOTICES.md"),
+    )
+    outputDir.set(layout.buildDirectory.dir("generated/legalAssets"))
+}
+
+androidComponents {
+    onVariants { variant ->
+        variant.sources.assets?.addGeneratedSourceDirectory(generateLegalAssets, GenerateLegalAssets::outputDir)
+    }
+}
+
 android {
     namespace = "org.terminalmax.app"
 

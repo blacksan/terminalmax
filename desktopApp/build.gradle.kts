@@ -32,8 +32,18 @@ dependencies {
 }
 
 // JNA's own native stub (jnidispatch) is shipped next to libwgbridge so that JNA never extracts it to a
-// temp directory or searches for it (see core/wireguard/README.md). It is taken from the very JNA jar
-// that the app runs with, so the versions always match.
+// temp directory or searches for it (see core/wireguard/README.md). It is taken from the JNA jar of the
+// catalog version, and the app's runtime classpath is constrained to exactly that version (`strictly`):
+// if conflict resolution ever wanted another JNA, resolution fails instead of silently pairing a stub
+// with a different jar.
+dependencies {
+    constraints {
+        add("implementation", "net.java.dev.jna:jna") {
+            version { strictly(libs.versions.jna.get()) }
+        }
+    }
+}
+
 val jnaDispatchJar by configurations.creating {
     isCanBeConsumed = false
     isCanBeResolved = true
@@ -61,17 +71,42 @@ val bundleJnaDispatch by tasks.registering(Copy::class) {
     into(layout.projectDirectory.dir("resources"))
 }
 
-// Packaging, the runnable distribution and `run` all read resources/; make sure the stub is there first.
+// The licence and the third-party notices travel inside the installed app: resources/common/ is
+// merged into $APPDIR/resources on every OS. Copy (not Sync): never delete the native libraries.
+val bundleLegalNotices by tasks.registering(Copy::class) {
+    description = "Copies LICENSE and THIRD_PARTY_NOTICES.md into the app resources (common/)."
+    from(rootProject.layout.projectDirectory.file("LICENSE"))
+    from(rootProject.layout.projectDirectory.file("THIRD_PARTY_NOTICES.md"))
+    into(layout.projectDirectory.dir("resources/common"))
+}
+
+// Packaging, the runnable distribution and `run` all read resources/; make sure the stub and the
+// notices are there first.
 tasks.matching {
     it.name == "prepareAppResources" || it.name == "run" ||
         it.name.startsWith("package") || it.name.startsWith("createDistributable")
 }.configureEach {
-    dependsOn(bundleJnaDispatch)
+    dependsOn(bundleJnaDispatch, bundleLegalNotices)
 }
 
 compose.desktop {
     application {
         mainClass = "org.terminalmax.desktop.MainKt"
+
+        // JNA reads these once, in the static initialiser of com.sun.jna.Native, so they must exist
+        // before any class loads: they are launcher JVM arguments, not something the backend sets
+        // "early enough". jpackage expands $APPDIR (the app/ directory of the installed app) in
+        // java-options; Compose passes -Dcompose.application.resources.dir=$APPDIR/resources the same
+        // way. The loader (core/wireguard) re-sets them as a fallback for `./gradlew run`, where
+        // $APPDIR is NOT expanded (the loader overrides jna.boot.library.path with the real path), and
+        // verifies after loading that JNA really used the bundled stub (`jnidispatch.path`).
+        // All of these properties exist in JNA 5.19.1 (Native.loadNativeDispatchLibrary).
+        jvmArgs += listOf(
+            "-Djna.nosys=true",
+            "-Djna.nounpack=true",
+            "-Djna.noclasspath=true",
+            "-Djna.boot.library.path=\$APPDIR/resources",
+        )
 
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi)

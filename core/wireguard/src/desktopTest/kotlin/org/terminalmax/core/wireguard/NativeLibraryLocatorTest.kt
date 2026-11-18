@@ -87,6 +87,54 @@ class NativeLibraryLocatorTest {
         assertEquals(dir, privateJnaTmpDir("Linux", emptyMap(), home.path))
     }
 
+    @Test
+    fun jnaDispatchPathMustBeReportedAndBeTheBundledStub() {
+        val root = tempDir()
+        val stub = File(root, "libjnidispatch.so").apply { writeBytes(byteArrayOf(1)) }
+        val real = stub.toPath().toRealPath().toFile()
+        // The exact bundled file is accepted (also through a non-canonical spelling).
+        verifyJnaDispatchPath(stub.path, real, root)
+        verifyJnaDispatchPath(File(root, "./libjnidispatch.so").path, real, root)
+        // JNA did not report a stub (system copy): refused.
+        assertFailsWith<WireGuardException> { verifyJnaDispatchPath(null, real, root) }
+        assertFailsWith<WireGuardException> { verifyJnaDispatchPath("", real, root) }
+        // JNA extracted its own copy into a temp-like directory: refused.
+        val other = File(tempDir(), "libjnidispatch.so").apply { writeBytes(byteArrayOf(1)) }
+        assertFailsWith<WireGuardException> { verifyJnaDispatchPath(other.path, real, root) }
+        // A file that does not exist cannot be verified: refused.
+        assertFailsWith<WireGuardException> { verifyJnaDispatchPath(File(root, "gone.so").path, real, root) }
+        // The expected stub itself must lie inside the resources root.
+        assertFailsWith<WireGuardException> { verifyJnaDispatchPath(other.path, other, root) }
+    }
+
+    @Test
+    fun loadedBridgeFileMustBeTheResolvedFile() {
+        val dir = tempDir()
+        val lib = File(dir, "libwgbridge.so").apply { writeBytes(byteArrayOf(1)) }
+        val other = File(dir, "other.so").apply { writeBytes(byteArrayOf(1)) }
+        verifyLoadedLibraryFile(lib, lib)
+        assertFailsWith<WireGuardException> { verifyLoadedLibraryFile(null, lib) }
+        assertFailsWith<WireGuardException> { verifyLoadedLibraryFile(other, lib) }
+        assertFailsWith<WireGuardException> { verifyLoadedLibraryFile(File(dir, "gone.so"), lib) }
+    }
+
+    @Test
+    fun pinSetsEveryJnaProperty() {
+        val keys = listOf(
+            "jna.boot.library.path", "jna.boot.library.name", "jna.nosys", "jna.nounpack", "jna.noclasspath",
+        )
+        val saved = keys.associateWith { System.getProperty(it) }
+        try {
+            val dir = tempDir()
+            pinJnaDispatch(File(dir, "libjnidispatch.so"))
+            assertEquals(dir.path, System.getProperty("jna.boot.library.path"))
+            assertEquals("jnidispatch", System.getProperty("jna.boot.library.name"))
+            for (k in listOf("jna.nosys", "jna.nounpack", "jna.noclasspath")) assertEquals("true", System.getProperty(k), k)
+        } finally {
+            saved.forEach { (k, v) -> if (v == null) System.clearProperty(k) else System.setProperty(k, v) }
+        }
+    }
+
     private fun withProperties(vararg pairs: Pair<String, String?>, block: () -> Unit) {
         val saved = pairs.map { (k, _) -> k to System.getProperty(k) }
         try {

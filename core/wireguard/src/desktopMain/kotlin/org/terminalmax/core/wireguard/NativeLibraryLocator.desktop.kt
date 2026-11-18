@@ -91,7 +91,12 @@ internal fun resolveDevLibrary(path: String): File {
  * Points JNA at the bundled `jnidispatch` and forbids every other way of finding or extracting
  * it: no system library path (`jna.nosys`), no extraction to a temp directory (`jna.nounpack`),
  * no classpath fall-back (`jna.noclasspath`). If the bundled stub cannot be loaded JNA throws.
- * Must run before the first JNA class is initialised.
+ *
+ * All five properties are real in JNA 5.19.1 (`Native.loadNativeDispatchLibrary`). JNA reads them
+ * once, in the static initialiser of `com.sun.jna.Native`, so this is only the FALLBACK for
+ * `./gradlew run` and for processes that were not started by the packaged launcher: the packaged
+ * launcher passes the same properties as JVM arguments (`desktopApp/build.gradle.kts`), and
+ * [verifyJnaDispatchPath] proves after loading which stub JNA really uses.
  */
 internal fun pinJnaDispatch(dispatch: File) {
     System.setProperty("jna.boot.library.path", dispatch.parentFile.path)
@@ -99,6 +104,47 @@ internal fun pinJnaDispatch(dispatch: File) {
     System.setProperty("jna.nosys", "true")
     System.setProperty("jna.nounpack", "true")
     System.setProperty("jna.noclasspath", "true")
+}
+
+/**
+ * JNA sets the system property `jnidispatch.path` to the stub it loaded (only when it loaded one
+ * from `jna.boot.library.path` or extracted one from the classpath, never for a system copy).
+ * Fails closed unless that property names, after resolving links, exactly the bundled stub
+ * [expected], which itself must lie inside [resourcesRoot]. This holds even if some other code
+ * initialised JNA before this backend did.
+ */
+internal fun verifyJnaDispatchPath(jnidispatchPath: String?, expected: File, resourcesRoot: File) {
+    if (jnidispatchPath.isNullOrEmpty()) {
+        throw WireGuardException("wgbridge: JNA did not report which native stub it loaded; refusing to continue")
+    }
+    try {
+        val actual = File(jnidispatchPath).toPath().toRealPath()
+        val want = expected.toPath().toRealPath()
+        val root = resourcesRoot.toPath().toRealPath()
+        if (!want.startsWith(root)) {
+            throw WireGuardException("wgbridge: the bundled JNA stub is not inside the application resources")
+        }
+        if (actual != want) {
+            throw WireGuardException("wgbridge: JNA loaded a native stub other than the bundled one; refusing to continue")
+        }
+    } catch (e: IOException) {
+        throw WireGuardException("wgbridge: the JNA native stub path cannot be verified", e)
+    } catch (e: SecurityException) {
+        throw WireGuardException("wgbridge: the JNA native stub path cannot be verified", e)
+    }
+}
+
+/** Fails closed unless [actual] (the file JNA reports for the loaded bridge) is exactly [expected]. */
+internal fun verifyLoadedLibraryFile(actual: File?, expected: File) {
+    try {
+        if (actual == null || actual.toPath().toRealPath() != expected.toPath().toRealPath()) {
+            throw WireGuardException("wgbridge: the loaded bridge is not the resolved bundled file; refusing to continue")
+        }
+    } catch (e: IOException) {
+        throw WireGuardException("wgbridge: the loaded bridge file cannot be verified", e)
+    } catch (e: SecurityException) {
+        throw WireGuardException("wgbridge: the loaded bridge file cannot be verified", e)
+    }
 }
 
 /**

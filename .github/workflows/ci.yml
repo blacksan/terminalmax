@@ -29,7 +29,7 @@ jobs:
         with:
           go-version: "1.24.x"
           cache: false
-      # go.sum is not committed yet (see native.yml).
+      # go.sum is committed: download checks every module against it, verify re-hashes the module cache.
       - name: go mod download && go mod verify
         working-directory: native/wgbridge
         run: go mod download && go mod verify
@@ -62,6 +62,12 @@ jobs:
             for abi in arm64-v8a x86_64; do
               if ! grep -q "lib/$abi/libwgbridge.so" <<<"$listing"; then
                 echo "::error::$apk does not contain lib/$abi/libwgbridge.so"
+                exit 1
+              fi
+            done
+            for asset in assets/LICENSE assets/THIRD_PARTY_NOTICES.md; do
+              if ! grep -q " $asset\$" <<<"$listing"; then
+                echo "::error::$apk does not contain $asset"
                 exit 1
               fi
             done
@@ -129,18 +135,45 @@ jobs:
           app="$(find "$mnt" -maxdepth 1 -name '*.app' -print -quit)"
           [ -n "$app" ] || { echo "::error::no .app inside ${dmgs[0]}"; ls -la "$mnt"; exit 1; }
           res="$app/Contents/app/resources"
-          for f in libwgbridge.dylib libjnidispatch.jnilib; do
+          for f in libwgbridge.dylib libjnidispatch.jnilib LICENSE THIRD_PARTY_NOTICES.md; do
             if [ ! -f "$res/$f" ]; then
               echo "::error::$f missing from $res inside the DMG"
               find "$app" \( -name '*wgbridge*' -o -name '*jnidispatch*' \) -print
               exit 1
             fi
-            file "$res/$f"
-            codesign -dv "$res/$f" 2>&1 | head -n 5 || true
+            case "$f" in *.dylib|*.jnilib) file "$res/$f"; codesign -dv "$res/$f" 2>&1 | head -n 5 || true ;; esac
           done
           file "$res/libwgbridge.dylib" | grep -q arm64 || { echo "::error::libwgbridge.dylib is not arm64"; exit 1; }
           codesign --verify --strict "$res/libwgbridge.dylib"
           echo "OK: $app"
+      # First proof that the PACKAGED app can load JNA and the bridge: run the launcher inside the built
+      # .app (createDistributable output, the same image the DMG is made from) with --self-test.
+      - name: Self-test the packaged macOS app (JNA + bridge load)
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          ./gradlew :desktopApp:createDistributable --stacktrace
+          bin="desktopApp/build/compose/binaries/main/app/TerminalMax.app/Contents/MacOS/TerminalMax"
+          [ -x "$bin" ] || { echo "::error::launcher not found: $bin"; find desktopApp/build/compose/binaries/main/app -maxdepth 4 | head -n 40; exit 1; }
+          out="$RUNNER_TEMP/tmx-selftest.txt"
+          rm -f "$out"
+          set +e
+          "$bin" "--self-test=$out" > "$RUNNER_TEMP/tmx-selftest.stdout" 2> "$RUNNER_TEMP/tmx-selftest.stderr"
+          rc=$?
+          set -e
+          echo "exit code: $rc"
+          echo "--- stdout"; cat "$RUNNER_TEMP/tmx-selftest.stdout" || true
+          echo "--- stderr"; cat "$RUNNER_TEMP/tmx-selftest.stderr" || true
+          echo "--- result file"; cat "$out" || true
+          [ "$rc" -eq 0 ] || { echo "::error::packaged app self-test exited with $rc"; exit 1; }
+          [ -f "$out" ] || { echo "::error::self-test wrote no result file"; exit 1; }
+          grep -qx 'SELFTEST OK' "$out" || { echo "::error::no SELFTEST OK line in the result file"; exit 1; }
+          grep -q '^wgbridge version: ' "$out" || { echo "::error::bridge version missing"; exit 1; }
+          grep -q '^jna stub: .*/Contents/app/resources/libjnidispatch.jnilib$' "$out" \
+            || { echo "::error::JNA did not use the bundled stub"; exit 1; }
+          grep -q '^bridge library: .*/Contents/app/resources/libwgbridge.dylib$' "$out" \
+            || { echo "::error::the bridge was not loaded from the app resources"; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terminalmax-macos-arm64-dmg
@@ -189,7 +222,7 @@ jobs:
             Get-Content $log -Tail 60
             throw "msiexec /a failed with exit code $($p.ExitCode)"
           }
-          foreach ($name in @('wgbridge.dll', 'jnidispatch.dll')) {
+          foreach ($name in @('wgbridge.dll', 'jnidispatch.dll', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
             $hits = @(Get-ChildItem -Path $target -Recurse -File -Filter $name |
               Where-Object { $_.FullName -match '\\app\\resources\\[^\\]+$' })
             if ($hits.Count -ne 1) {
@@ -198,6 +231,30 @@ jobs:
             }
             Write-Host "OK: $($hits[0].FullName) ($($hits[0].Length) bytes)"
           }
+      # First proof that the PACKAGED app can load JNA and the bridge. The launcher is a GUI-subsystem
+      # executable that may have no stdout, so the result is read from the file given in --self-test=<path>.
+      - name: Self-test the packaged Windows app (JNA + bridge load)
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./gradlew.bat :desktopApp:createDistributable --stacktrace
+          if ($LASTEXITCODE -ne 0) { throw "createDistributable failed ($LASTEXITCODE)" }
+          $exe = (Resolve-Path 'desktopApp/build/compose/binaries/main/app/TerminalMax/TerminalMax.exe').Path
+          $out = Join-Path $env:RUNNER_TEMP 'tmx-selftest.txt'
+          Remove-Item $out -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath $exe -ArgumentList "--self-test=$out" -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'self-test timed out' }
+          $rc = $p.ExitCode
+          Write-Host "exit code: $rc"
+          if (Test-Path $out) { Write-Host '--- result file'; Get-Content $out } else { Write-Host 'no result file' }
+          if ($rc -ne 0) { throw "packaged app self-test exited with $rc" }
+          if (-not (Test-Path $out)) { throw 'self-test wrote no result file' }
+          $text = Get-Content $out -Raw
+          if ($text -notmatch '(?m)^SELFTEST OK\r?$') { throw 'no SELFTEST OK line in the result file' }
+          if ($text -notmatch '(?m)^wgbridge version: ') { throw 'bridge version missing' }
+          if ($text -notmatch '(?m)^jna stub: .*[\\/]app[\\/]resources[\\/]jnidispatch\.dll\r?$') { throw 'JNA did not use the bundled stub' }
+          if ($text -notmatch '(?m)^bridge library: .*[\\/]app[\\/]resources[\\/]wgbridge\.dll\r?$') { throw 'the bridge was not loaded from the app resources' }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terminalmax-windows-x64-msi

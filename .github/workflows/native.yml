@@ -32,8 +32,9 @@ jobs:
         with:
           go-version: "1.24.x"
           cache: false
-      # go.sum is not committed yet. Once it is, replace this step with
-      # `go mod download && go mod verify && go mod tidy -diff`.
+      # go.sum is committed: `go mod download` checks every module against it and `go mod verify`
+      # re-hashes the module cache. (`go mod tidy -diff` is deliberately not run: it needs network
+      # access to resolve test-only dependencies of dependencies and was not verified for this module.)
       - name: go mod download && go mod verify
         run: go mod download && go mod verify
       - name: go vet
@@ -44,26 +45,6 @@ jobs:
       # loopback UDP; it is kept out of the -race run on purpose.
       - name: go test (tunnel integration, no race detector)
         run: go test ./tunnel/ -count=1 -timeout 180s -v
-      # go.sum is not committed yet. Copy go.mod and go.sum from this log (between the markers)
-      # into native/wgbridge/ and commit them; then switch the tidy steps to
-      # `go mod download && go mod verify && go mod tidy -diff`.
-      - name: Print go.mod and go.sum
-        if: always()
-        run: |
-          echo "----- BEGIN go.mod -----"
-          cat go.mod
-          echo "----- END go.mod -----"
-          echo "----- BEGIN go.sum -----"
-          cat go.sum
-          echo "----- END go.sum -----"
-      - name: Upload go.mod / go.sum
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: go-mod-files
-          path: |
-            native/wgbridge/go.mod
-            native/wgbridge/go.sum
-          if-no-files-found: error
 
   android:
     runs-on: ubuntu-24.04
@@ -75,8 +56,7 @@ jobs:
         with:
           go-version: "1.24.x"
           cache: false
-      # TODO: replace with `go mod download && go mod verify && go mod tidy -diff`
-      # once go.sum is committed.
+      # go.sum is committed: download checks every module against it, verify re-hashes the cache.
       - name: go mod download && go mod verify
         run: go mod download && go mod verify
       - name: Build libwgbridge.so
@@ -97,8 +77,7 @@ jobs:
         with:
           go-version: "1.24.x"
           cache: false
-      # TODO: replace with `go mod download && go mod verify && go mod tidy -diff`
-      # once go.sum is committed.
+      # go.sum is committed: download checks every module against it, verify re-hashes the cache.
       - name: go mod download && go mod verify
         run: go mod download && go mod verify
       - name: Build libwgbridge.dylib
@@ -120,8 +99,7 @@ jobs:
         with:
           go-version: "1.24.x"
           cache: false
-      # TODO: replace with `go mod download && go mod verify && go mod tidy -diff`
-      # once go.sum is committed.
+      # go.sum is committed: download checks every module against it, verify re-hashes the cache.
       - name: go mod download && go mod verify
         shell: bash
         run: go mod download && go mod verify

@@ -69,13 +69,25 @@ R8 rule keeps the native method names.
    `createWireGuardBackend()` throws a `WireGuardException` ("bundled native library is missing for
    this platform"). The default JNA search (`Native.load("wgbridge")`, `jna.library.path`, the OS
    library path, `~/Library/Frameworks`, `PATH`, the current directory) is never used.
-2. JNA's own native stub (`jnidispatch`) is shipped next to the bridge and pinned before any JNA
-   class is initialised: `jna.boot.library.path=<resources dir>`, `jna.nosys=true`,
-   `jna.nounpack=true`, `jna.noclasspath=true`. Nothing is extracted to a temp directory and no
-   other copy can be found; if the bundled stub is missing or cannot be loaded, loading fails.
+2. JNA's own native stub (`jnidispatch`) is shipped next to the bridge and pinned with
+   `jna.boot.library.path=<resources dir>`, `jna.nosys=true`, `jna.nounpack=true` and
+   `jna.noclasspath=true` (all four, plus `jna.boot.library.name`, are read by `Native.loadNativeDispatchLibrary`
+   in JNA 5.19.1). JNA reads them once, in the static initialiser of `com.sun.jna.Native`, so the
+   **packaged launcher passes them as JVM arguments** (`compose.desktop.application.jvmArgs` in
+   `:desktopApp`, `-Djna.boot.library.path=$APPDIR/resources`): they hold before any class loads and no
+   longer depend on the backend being the first JNA user. The loader sets the same properties itself
+   only as a fallback for `./gradlew run`, where `$APPDIR` is not expanded.
+   **Verified after loading, fail closed:** the stub JNA reports in the `jnidispatch.path` system
+   property must resolve (links followed) to exactly the bundled stub inside the resources directory,
+   and `NativeLibrary.getInstance(<bridge path>).file` must be exactly the resolved bridge file;
+   otherwise `createWireGuardBackend()` throws `WireGuardException` and the library is never used (so a
+   system copy, an extraction to a temp directory or another JNA user's different settings are
+   detected, whoever initialised JNA first). `desktopNativeInfo()` returns the verified paths for
+   diagnostics (used by the packaged app's `--self-test`). Nothing is extracted to a temp directory and
+   no other copy can be found; if the bundled stub is missing or cannot be loaded, loading fails.
    `:desktopApp` copies the stub (`libjnidispatch.jnilib` for macOS arm64, `jnidispatch.dll` for
-   Windows x64) out of the very `jna` jar the app runs with (task `bundleJnaDispatch`).
-   **The backend must be the first JNA user in the process** (the app has no other).
+   Windows x64) out of the `jna` jar of the catalog version (task `bundleJnaDispatch`) and constrains
+   the app's classpath to exactly that JNA version.
 3. `-Dterminalmax.wgbridge.path=<absolute file>` is honoured **only** together with
    `-Dterminalmax.dev=true` (unit/integration tests, the e2e CI job, local development). Without
    the flag the property is an error, not ignored. In dev mode, when no bundled stub exists, JNA may
@@ -85,7 +97,9 @@ R8 rule keeps the native method names.
 
 Not done: a build-time SHA-256 of the bridge that the loader verifies, and Developer ID signing of
 the bundled dylibs (the bridge is ad-hoc signed by `native/wgbridge/build-desktop.sh`; the JNA stub
-keeps the signature of the upstream jar).
+keeps the signature of the upstream jar). The residual attack (a same-user attacker who can write the
+app's resources directory) is closed only by Developer ID signing with library validation (macOS) or a
+per-machine install (Windows).
 
 ## Bundling (libraries are built by CI, never committed)
 
@@ -113,5 +127,6 @@ The Go runtime's timers stop while the CPU is suspended (the bridge does not car
 
 `desktopTest` covers stats JSON parsing, argument validation, zero-filling, token wiping and close
 semantics with a fake bridge, plus the loader rules (no fall-through to `jna.library.path`, symbolic
-links and files outside the resources directory are rejected, the override needs the dev flag).
-Loading the real library is exercised by `:integration-tests`.
+links and files outside the resources directory are rejected, the override needs the dev flag, the
+`jnidispatch.path` and bridge-file checks fail closed). Loading the real library is exercised by
+`:integration-tests`, and loading it from the PACKAGED macOS and Windows apps by the CI `--self-test` steps.

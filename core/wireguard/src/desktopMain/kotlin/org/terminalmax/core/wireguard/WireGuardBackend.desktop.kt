@@ -4,8 +4,10 @@ package org.terminalmax.core.wireguard
 import com.sun.jna.Library
 import com.sun.jna.Memory
 import com.sun.jna.Native
+import com.sun.jna.NativeLibrary
 import com.sun.jna.Pointer
 import java.io.File
+import java.io.IOException
 
 /**
  * The C ABI exactly as exported by native/wgbridge/cmd/libwgbridge/main.go. `char *` parameters
@@ -25,9 +27,33 @@ internal interface WgBridgeLib : Library {
 private const val ERR_LEN = 512
 private const val STATS_LEN = 1024
 
+/**
+ * What was actually loaded, for diagnostics and the packaged app's `--self-test`. Only exists after
+ * a successful [createWireGuardBackend]; contains file paths only, never key material.
+ */
+class DesktopNativeInfo internal constructor(
+    /** Real path of the application resources directory (null when the dev override is used). */
+    val resourcesDir: String?,
+    /** Real path of the bridge library that was loaded. */
+    val bridgeLibrary: String,
+    /** Real path of the JNA stub that was loaded and verified, or null (dev mode without a bundled stub). */
+    val jnaDispatch: String?,
+    /** Version of the JNA jar (`Native.VERSION`). */
+    val jnaVersion: String,
+    /** True if JNA had already been initialised by someone else before the backend was (see [verifyJnaDispatchPath]). */
+    val jnaInitialisedBeforeBackend: Boolean,
+)
+
+/** The paths used by the loaded bridge, or null if [createWireGuardBackend] has not succeeded yet. */
+fun desktopNativeInfo(): DesktopNativeInfo? = LibraryHolder.info
+
 /** The holder keeps the proxy (and with it the JNA library handle) reachable forever: never unloaded. */
 private object LibraryHolder {
     private var lib: WgBridgeLib? = null
+
+    @Volatile
+    var info: DesktopNativeInfo? = null
+        private set
 
     @Synchronized
     fun get(): WgBridgeLib {
@@ -40,18 +66,28 @@ private object LibraryHolder {
     /**
      * Packaged builds load the bridge ONLY from an absolute path inside the application's resources
      * directory ([RESOURCES_PROPERTY]) and pin JNA's own native stub to the copy bundled next to it
-     * (`jna.boot.library.path`, `jna.nounpack`, `jna.nosys`): nothing is searched, nothing is
-     * extracted to a temp directory. There is no fall-back to the default JNA search.
+     * (`jna.boot.library.path`, `jna.nounpack`, `jna.nosys`, `jna.noclasspath`): nothing is
+     * searched, nothing is extracted to a temp directory. There is no fall-back to the default JNA
+     * search.
+     *
+     * The packaged launcher already passes these properties as JVM arguments, so they hold before
+     * any class is loaded; setting them here is only the fallback for `./gradlew run`. Independent
+     * of who initialised JNA first, after loading we require that the stub JNA reports
+     * (`jnidispatch.path`) and the bridge file are exactly the bundled files, and fail closed
+     * (the library is then never used) otherwise.
      *
      * Only with `-Dterminalmax.dev=true` may [PATH_PROPERTY] name another library (tests, the e2e
-     * job, `./gradlew run`). JNA properties are set here, before the first JNA class is
-     * initialised, so this must be the first JNA user in the process.
+     * job, `./gradlew run`).
      */
     private fun load(): WgBridgeLib {
         val os = System.getProperty("os.name") ?: ""
         val dev = isDevMode()
         val explicit = System.getProperty(PATH_PROPERTY)
+        // Read before anything below can initialise JNA.
+        val jnaEarly = System.getProperty("jna.loaded") == "true"
         val library: File
+        var dispatch: File? = null
+        var root: File? = null
         if (!explicit.isNullOrEmpty()) {
             if (!dev) {
                 throw WireGuardException("wgbridge: $PATH_PROPERTY is only honoured together with -D$DEV_PROPERTY=true")
@@ -61,22 +97,37 @@ private object LibraryHolder {
         } else {
             val resources = System.getProperty(RESOURCES_PROPERTY)
             library = resolveBundledFile(resources, nativeLibraryFileName(os), "native library")
-            if (dev) {
-                val dispatch = try {
+            root = try {
+                File(resources!!).toPath().toRealPath().toFile()
+            } catch (e: IOException) {
+                throw WireGuardException("wgbridge: the application resources directory cannot be resolved", e)
+            }
+            dispatch = if (dev) {
+                try {
                     resolveBundledFile(resources, jnaDispatchFileName(os), "JNA stub")
                 } catch (_: WireGuardException) {
                     null
                 }
-                if (dispatch != null) pinJnaDispatch(dispatch) else useJnaDefaultsForDev(os)
             } else {
-                pinJnaDispatch(resolveBundledFile(resources, jnaDispatchFileName(os), "JNA stub"))
+                resolveBundledFile(resources, jnaDispatchFileName(os), "JNA stub")
             }
+            if (dispatch != null) pinJnaDispatch(dispatch) else useJnaDefaultsForDev(os)
         }
-        try {
-            return Native.load(library.path, WgBridgeLib::class.java)
+        val loaded = try {
+            Native.load(library.path, WgBridgeLib::class.java)
         } catch (e: LinkageError) {
             throw WireGuardException("wgbridge: native library could not be loaded", e)
         }
+        if (dispatch != null && root != null) {
+            verifyJnaDispatchPath(System.getProperty("jnidispatch.path"), dispatch, root)
+        }
+        try {
+            verifyLoadedLibraryFile(NativeLibrary.getInstance(library.path).file, library)
+        } catch (e: LinkageError) {
+            throw WireGuardException("wgbridge: the loaded bridge cannot be verified", e)
+        }
+        info = DesktopNativeInfo(root?.path, library.path, dispatch?.path, Native.VERSION, jnaEarly)
+        return loaded
     }
 
     /** Dev mode without a bundled JNA stub: let JNA extract it, but into a private directory. */
