@@ -25,6 +25,9 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
       - name: Build debug APK and run tests
         run: ./gradlew :androidApp:assembleDebug desktopTest --stacktrace
+      # Unsigned is fine: this only makes R8 (and the consumer keep rules) actually run.
+      - name: Build R8-minified release APK
+        run: ./gradlew :androidApp:assembleRelease --stacktrace
       - uses: actions/upload-artifact@v7
         with:
           name: terminalmax-debug-apk

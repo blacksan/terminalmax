@@ -12,10 +12,14 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        // JediTerm's emulator core is published only to the JetBrains repository.
-        maven {
-            url = uri("https://packages.jetbrains.team/maven/p/ij/intellij-dependencies")
-            content { includeGroup("org.jetbrains.jediterm") }
+        // JediTerm's emulator core is published only to the JetBrains repository. exclusiveContent
+        // means this group is resolved from that repository only (never probed on google() or
+        // mavenCentral()), and nothing else is resolved from it.
+        exclusiveContent {
+            forRepository {
+                maven { url = uri("https://packages.jetbrains.team/maven/p/ij/intellij-dependencies") }
+            }
+            filter { includeGroup("org.jetbrains.jediterm") }
         }
     }
 }

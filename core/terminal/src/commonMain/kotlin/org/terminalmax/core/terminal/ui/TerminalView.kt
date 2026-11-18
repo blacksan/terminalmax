@@ -34,6 +34,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.key.utf16CodePoint
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
@@ -48,10 +49,15 @@ import androidx.compose.ui.unit.sp
 import org.terminalmax.core.terminal.Cell
 import org.terminalmax.core.terminal.CellStyle
 import org.terminalmax.core.terminal.KeyModifiers
+import org.terminalmax.core.terminal.KeyboardInput
 import org.terminalmax.core.terminal.TerminalColor
 import org.terminalmax.core.terminal.TerminalEngine
 import org.terminalmax.core.terminal.TerminalKey
-import org.terminalmax.core.terminal.XtermKeyEncoder
+import org.terminalmax.core.terminal.TerminalLimits
+import org.terminalmax.core.terminal.TypedTextState
+import org.terminalmax.core.terminal.createTypedTextState
+import org.terminalmax.core.terminal.isAltGraph
+import org.terminalmax.core.terminal.typedText
 
 /** Colours and flags of one [CellStyle] after palette lookup, inverse and dim handling. */
 private class ResolvedStyle(
@@ -69,10 +75,118 @@ private class ResolvedStyle(
 
 private const val MEASURE_REPEAT = 32
 
+/** Longest ASCII run drawn as one text layout; bounds drift if the font advance is fractional. */
+private const val MAX_RUN_COLUMNS = 32
+
+/** The style cache is cleared above this many entries (truecolour streams create endless styles). */
+private const val MAX_STYLE_CACHE = 1024
+
+private class BackgroundRun(val startCol: Int, val endCol: Int, val color: Color)
+
+private class TextRun(val col: Int, val layout: TextLayoutResult)
+
+/** Everything needed to draw one row; rebuilt only when the row's cells change. */
+private class RowRender(val cells: List<Cell>, val backgrounds: List<BackgroundRun>, val texts: List<TextRun>)
+
+/**
+ * Per-view render state: resolved-style cache (bounded) and one cached [RowRender] per screen row.
+ * Recreated when the palette, font or measurer changes. Only touched from the draw phase.
+ */
+private class RenderCache(
+    val measurer: TextMeasurer,
+    val base: TextStyle,
+    val palette: TerminalPalette,
+) {
+    private val styles = HashMap<CellStyle, ResolvedStyle>()
+    private var rows = arrayOfNulls<RowRender>(0)
+
+    fun resolve(style: CellStyle): ResolvedStyle {
+        styles[style]?.let { return it }
+        if (styles.size >= MAX_STYLE_CACHE) styles.clear()
+        val resolved = resolveStyle(style, palette)
+        styles[style] = resolved
+        return resolved
+    }
+
+    fun row(index: Int, cells: List<Cell>, rowCount: Int): RowRender {
+        if (rows.size != rowCount) rows = arrayOfNulls(rowCount)
+        val cached = rows[index]
+        if (cached != null && cached.cells == cells) return cached
+        val built = build(cells)
+        rows[index] = built
+        return built
+    }
+
+    private fun build(cells: List<Cell>): RowRender {
+        val resolved = ArrayList<ResolvedStyle>(cells.size)
+        for (cell in cells) resolved.add(resolve(cell.style))
+
+        // Backgrounds: one rect per run of equal colour.
+        val backgrounds = ArrayList<BackgroundRun>()
+        var c = 0
+        while (c < cells.size) {
+            val bg = resolved[c].bg
+            var e = c + 1
+            while (e < cells.size && resolved[e].bg == bg) e++
+            if (bg != palette.background) backgrounds.add(BackgroundRun(c, e, bg))
+            c = e
+        }
+
+        // Text: ASCII runs of equal style are one layout; everything else is laid out per cell so
+        // glyphs with a different advance (box drawing, CJK, emoji, fallback fonts) stay on the grid.
+        val texts = ArrayList<TextRun>()
+        c = 0
+        while (c < cells.size) {
+            val cell = cells[c]
+            if (cell.width == 0) {
+                c++
+                continue
+            }
+            val rs = resolved[c]
+            if (!isPlainAscii(cell)) {
+                if (cell.text.isNotBlank()) texts.add(TextRun(c, measureRun(cell.text, rs)))
+                c++
+                continue
+            }
+            var e = c + 1
+            val sb = StringBuilder(cell.text)
+            while (e < cells.size && e - c < MAX_RUN_COLUMNS && isPlainAscii(cells[e]) && resolved[e].sameGlyphStyle(rs)) {
+                sb.append(cells[e].text)
+                e++
+            }
+            val text = sb.toString()
+            if (text.isNotBlank() || rs.underline || rs.strikethrough) texts.add(TextRun(c, measureRun(text, rs)))
+            c = e
+        }
+        return RowRender(cells, backgrounds, texts)
+    }
+
+    fun measureRun(text: String, rs: ResolvedStyle, color: Color = rs.fg): TextLayoutResult {
+        val decoration = when {
+            rs.underline && rs.strikethrough ->
+                TextDecoration.combine(listOf(TextDecoration.Underline, TextDecoration.LineThrough))
+            rs.underline -> TextDecoration.Underline
+            rs.strikethrough -> TextDecoration.LineThrough
+            else -> null
+        }
+        val style = base.copy(
+            color = color,
+            fontWeight = if (rs.bold) FontWeight.Bold else null,
+            fontStyle = if (rs.italic) FontStyle.Italic else null,
+            textDecoration = decoration,
+        )
+        return measurer.measure(text = text, style = style, softWrap = false, maxLines = 1)
+    }
+}
+
 /**
  * Shared Compose Canvas renderer for a [TerminalEngine].
  *
- * Hardware keyboard only: soft-keyboard/IME input on Android is out of scope for this spike.
+ * Input: hardware keyboard only (see `core/terminal/README.md`); soft-keyboard/IME input on
+ * Android is out of scope for this spike.
+ *
+ * Rendering: the engine revision is read inside the Canvas draw scope, so output only redraws
+ * (no recomposition). Each row is cached and rebuilt only when its cells change.
  */
 @Composable
 fun TerminalView(
@@ -83,9 +197,15 @@ fun TerminalView(
     onInput: (ByteArray) -> Unit,
     onSizeChanged: (cols: Int, rows: Int) -> Unit = { _, _ -> },
 ) {
-    val textMeasurer = rememberTextMeasurer(cacheSize = 512)
+    val textMeasurer = rememberTextMeasurer(cacheSize = 2048)
     val baseStyle = remember(fontSize, palette) {
-        TextStyle(fontFamily = FontFamily.Monospace, fontSize = fontSize, color = palette.foreground)
+        TextStyle(
+            fontFamily = FontFamily.Monospace,
+            fontSize = fontSize,
+            color = palette.foreground,
+            // Ligatures would merge cells and break the grid.
+            fontFeatureSettings = "liga 0, calt 0",
+        )
     }
     val cellSize = remember(textMeasurer, baseStyle) {
         val layout = textMeasurer.measure(
@@ -94,7 +214,8 @@ fun TerminalView(
             softWrap = false,
             maxLines = 1,
         )
-        Size(layout.size.width.toFloat() / MEASURE_REPEAT, layout.size.height.toFloat())
+        // getLineRight is the exact (unrounded) advance of the whole line.
+        Size(layout.getLineRight(0) / MEASURE_REPEAT, layout.size.height.toFloat())
     }
     val cellW = cellSize.width
     val cellH = cellSize.height
@@ -104,11 +225,12 @@ fun TerminalView(
     val focusRequester = remember { FocusRequester() }
     val currentOnInput by rememberUpdatedState(onInput)
     val currentOnSizeChanged by rememberUpdatedState(onSizeChanged)
+    val keyState = remember { createTypedTextState() }
 
     LaunchedEffect(engine, pixelSize, cellW, cellH) {
         if (pixelSize.width > 0 && pixelSize.height > 0 && cellW > 0f && cellH > 0f) {
-            val newCols = (pixelSize.width / cellW).toInt().coerceAtLeast(2)
-            val newRows = (pixelSize.height / cellH).toInt().coerceAtLeast(2)
+            val newCols = (pixelSize.width / cellW).toInt().coerceIn(TerminalLimits.MIN_COLS, TerminalLimits.MAX_COLS)
+            val newRows = (pixelSize.height / cellH).toInt().coerceIn(TerminalLimits.MIN_ROWS, TerminalLimits.MAX_ROWS)
             if (newCols != engine.cols || newRows != engine.rows) {
                 engine.resize(newCols, newRows)
             }
@@ -116,11 +238,10 @@ fun TerminalView(
         }
     }
 
-    // Re-read the snapshot whenever the engine reports a change.
-    val revision by engine.revision.collectAsState()
-    val snapshot = remember(engine, revision) { engine.snapshot() }
+    // Observed inside the draw scope below, not here: output redraws without recomposing.
+    val revision = engine.revision.collectAsState()
 
-    val resolvedCache = remember(palette) { HashMap<CellStyle, ResolvedStyle>() }
+    val renderCache = remember(textMeasurer, baseStyle, palette) { RenderCache(textMeasurer, baseStyle, palette) }
 
     Canvas(
         modifier = modifier
@@ -128,65 +249,38 @@ fun TerminalView(
             .onSizeChanged { pixelSize = it }
             .focusRequester(focusRequester)
             .onFocusChanged { focused = it.isFocused }
-            .onPreviewKeyEvent { event -> handleKeyEvent(event, engine) { currentOnInput(it) } }
+            .onPreviewKeyEvent { event -> handleKeyEvent(event, engine, keyState) { currentOnInput(it) } }
             .focusable()
             .pointerInput(Unit) { detectTapGestures { focusRequester.requestFocus() } },
     ) {
+        @Suppress("UNUSED_VARIABLE")
+        val observedRevision = revision.value // read in the draw phase so a new revision redraws
+        val snapshot = engine.snapshot()
         drawRect(palette.background)
         val rowsToDraw = minOf(snapshot.rows, snapshot.lines.size)
         for (r in 0 until rowsToDraw) {
-            val row = snapshot.lines[r]
+            val row = renderCache.row(r, snapshot.lines[r], rowsToDraw)
             val y = r * cellH
-            val resolved = row.map { resolve(it.style, palette, resolvedCache) }
-
-            // Backgrounds: one rect per run of equal colour.
-            var c = 0
-            while (c < row.size) {
-                val bg = resolved[c].bg
-                var e = c + 1
-                while (e < row.size && resolved[e].bg == bg) e++
-                if (bg != palette.background) {
-                    drawRect(bg, Offset(c * cellW, y), Size((e - c) * cellW, cellH))
-                }
-                c = e
+            for (bg in row.backgrounds) {
+                drawRect(bg.color, Offset(bg.startCol * cellW, y), Size((bg.endCol - bg.startCol) * cellW, cellH))
             }
-
-            // Text: ASCII runs of equal style are drawn as one string; everything else per cell so
-            // glyphs with a different advance (box drawing, CJK) stay on the grid.
-            c = 0
-            while (c < row.size) {
-                val cell = row[c]
-                if (cell.width == 0) {
-                    c++
-                    continue
-                }
-                val rs = resolved[c]
-                if (!isPlainAscii(cell)) {
-                    if (cell.text.isNotBlank()) {
-                        drawRun(textMeasurer, baseStyle, cell.text, rs, Offset(c * cellW, y))
-                    }
-                    c++
-                    continue
-                }
-                var e = c + 1
-                val sb = StringBuilder(cell.text)
-                while (e < row.size && isPlainAscii(row[e]) && resolved[e].sameGlyphStyle(rs)) {
-                    sb.append(row[e].text)
-                    e++
-                }
-                val text = sb.toString()
-                if (text.isNotBlank() || rs.underline || rs.strikethrough) {
-                    drawRun(textMeasurer, baseStyle, text, rs, Offset(c * cellW, y))
-                }
-                c = e
+            for (run in row.texts) {
+                drawText(run.layout, topLeft = Offset(run.col * cellW, y))
             }
         }
 
-        if (snapshot.cursorVisible) {
+        if (snapshot.cursorVisible && snapshot.cursorRow < snapshot.lines.size) {
+            val cursorCell = snapshot.lines[snapshot.cursorRow].getOrNull(snapshot.cursorCol)
             val topLeft = Offset(snapshot.cursorCol * cellW, snapshot.cursorRow * cellH)
-            val size = Size(cellW, cellH)
+            val cursorWidth = cellW * (cursorCell?.width ?: 1).coerceAtLeast(1)
+            val size = Size(cursorWidth, cellH)
             if (focused) {
-                drawRect(palette.cursor.copy(alpha = 0.7f), topLeft, size)
+                // Cursor-coloured cell with the glyph redrawn in the background colour.
+                drawRect(palette.cursor, topLeft, size)
+                if (cursorCell != null && cursorCell.width > 0 && cursorCell.text.isNotBlank()) {
+                    val rs = renderCache.resolve(cursorCell.style)
+                    drawText(renderCache.measureRun(cursorCell.text, rs, palette.background), topLeft = topLeft)
+                }
             } else {
                 drawRect(palette.cursor, topLeft, size, style = Stroke(width = 1f))
             }
@@ -197,36 +291,6 @@ fun TerminalView(
 private fun isPlainAscii(cell: Cell): Boolean =
     cell.width == 1 && cell.text.length == 1 && cell.text[0].code in 0x20..0x7e
 
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawRun(
-    measurer: TextMeasurer,
-    base: TextStyle,
-    text: String,
-    rs: ResolvedStyle,
-    topLeft: Offset,
-) {
-    val decoration = when {
-        rs.underline && rs.strikethrough ->
-            TextDecoration.combine(listOf(TextDecoration.Underline, TextDecoration.LineThrough))
-        rs.underline -> TextDecoration.Underline
-        rs.strikethrough -> TextDecoration.LineThrough
-        else -> null
-    }
-    val style = base.copy(
-        color = rs.fg,
-        fontWeight = if (rs.bold) FontWeight.Bold else null,
-        fontStyle = if (rs.italic) FontStyle.Italic else null,
-        textDecoration = decoration,
-    )
-    drawText(
-        textMeasurer = measurer,
-        text = text,
-        topLeft = topLeft,
-        style = style,
-        softWrap = false,
-        maxLines = 1,
-    )
-}
-
 private fun resolveColor(color: TerminalColor, default: Color, palette: TerminalPalette, brighten: Boolean): Color =
     when (color) {
         TerminalColor.Default -> default
@@ -235,18 +299,18 @@ private fun resolveColor(color: TerminalColor, default: Color, palette: Terminal
         is TerminalColor.Rgb -> Color(color.r, color.g, color.b)
     }
 
-private fun resolve(style: CellStyle, palette: TerminalPalette, cache: HashMap<CellStyle, ResolvedStyle>): ResolvedStyle =
-    cache.getOrPut(style) {
-        var fg = resolveColor(style.fg, palette.foreground, palette, brighten = style.bold)
-        var bg = resolveColor(style.bg, palette.background, palette, brighten = false)
-        if (style.inverse) {
-            val t = fg
-            fg = bg
-            bg = t
-        }
-        if (style.dim) fg = fg.copy(alpha = fg.alpha * 0.6f)
-        ResolvedStyle(fg, bg, style.bold, style.italic, style.underline, style.strikethrough)
+private fun resolveStyle(style: CellStyle, palette: TerminalPalette): ResolvedStyle {
+    // Bold-as-bright brightens the foreground colour first; inverse then swaps fg and bg (as xterm).
+    var fg = resolveColor(style.fg, palette.foreground, palette, brighten = style.bold)
+    var bg = resolveColor(style.bg, palette.background, palette, brighten = false)
+    if (style.inverse) {
+        val t = fg
+        fg = bg
+        bg = t
     }
+    if (style.dim) fg = fg.copy(alpha = fg.alpha * 0.6f)
+    return ResolvedStyle(fg, bg, style.bold, style.italic, style.underline, style.strikethrough)
+}
 
 private fun mapSpecialKey(key: Key): TerminalKey? = when (key) {
     Key.Enter, Key.NumPadEnter -> TerminalKey.Enter
@@ -278,20 +342,47 @@ private fun mapSpecialKey(key: Key): TerminalKey? = when (key) {
     else -> null
 }
 
-private fun handleKeyEvent(event: KeyEvent, engine: TerminalEngine, send: (ByteArray) -> Unit): Boolean {
+/**
+ * Key handling (model documented in [KeyboardInput]): special keys and Ctrl/Alt combinations from
+ * the key-down, printable text from typed-character events, Meta/Cmd never sent.
+ */
+private fun handleKeyEvent(
+    event: KeyEvent,
+    engine: TerminalEngine,
+    keys: TypedTextState,
+    send: (ByteArray) -> Unit,
+): Boolean {
     if (event.type == KeyEventType.KeyUp) {
         // Swallow Escape release too so navigation handlers never see a lone KeyUp.
         return event.key == Key.Escape
     }
-    if (event.type != KeyEventType.KeyDown) return false
-    val mods = KeyModifiers(ctrl = event.isCtrlPressed, alt = event.isAltPressed, shift = event.isShiftPressed)
-    val special = mapSpecialKey(event.key)
-    if (special != null) {
-        send(engine.encodeKey(special, mods))
+    if (event.isMetaPressed) return false // Cmd/Win combinations belong to the host OS
+    // AltGraph is a layout shift, not Alt: its characters are plain text.
+    val altGraph = isAltGraph(event)
+    val mods = KeyModifiers(
+        ctrl = event.isCtrlPressed && !altGraph,
+        alt = event.isAltPressed && !altGraph,
+        shift = event.isShiftPressed,
+    )
+    val isKeyDown = event.type == KeyEventType.KeyDown
+    if (isKeyDown) {
+        val special = mapSpecialKey(event.key)
+        if (special != null) {
+            send(engine.encodeKey(special, mods))
+            return true
+        }
+    }
+    val typed = typedText(event, keys)
+    if (typed != null) {
+        val bytes = KeyboardInput.encodeText(typed.text, mods, typed.carriesCombinations, keys.optionComposes)
+            ?: return false
+        send(bytes)
         return true
     }
-    if (event.isMetaPressed) return false
-    val bytes = XtermKeyEncoder.encodeCodePoint(event.utf16CodePoint, mods) ?: return false
-    send(bytes)
-    return true
+    if (isKeyDown && !altGraph) {
+        val bytes = KeyboardInput.encodeKeyDown(event.utf16CodePoint, mods, keys.optionComposes) ?: return false
+        send(bytes)
+        return true
+    }
+    return false
 }

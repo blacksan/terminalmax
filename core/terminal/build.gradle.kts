@@ -11,24 +11,27 @@ kotlin {
     }
 
     sourceSets {
-        // Engine adapter shared by Android and desktop. A true intermediate source set between
-        // androidMain and jvm("desktop") is unreliable with the AGP KMP library plugin (KT-80409:
-        // the hierarchy-template group does not attach androidMain), so the same directory is
-        // added as a source root of both JVM-like leaf source sets instead.
-        val jvmCommonDir = "src/jvmCommonMain/kotlin"
-        getByName("androidMain").kotlin.srcDir(jvmCommonDir)
-        getByName("desktopMain").kotlin.srcDir(jvmCommonDir)
+        val commonMain = getByName("commonMain")
+
+        // Intermediate source set shared by the android and desktop (JVM) targets (same DSL as
+        // :core:ssh). Holds the JediTerm adapter; expect/actual declarations live in commonMain
+        // with actuals in androidMain/desktopMain.
+        val jvmCommonMain = create("jvmCommonMain") {
+            dependsOn(commonMain)
+            dependencies {
+                implementation(libs.jediterm.core)
+            }
+        }
+        getByName("androidMain").dependsOn(jvmCommonMain)
+        getByName("desktopMain").dependsOn(jvmCommonMain)
 
         commonMain.dependencies {
             api(libs.kotlinx.coroutines.core)
         }
-        getByName("androidMain").dependencies {
-            implementation(libs.jediterm.core)
-            implementation(libs.slf4j.api)
-        }
-        getByName("desktopMain").dependencies {
-            implementation(libs.jediterm.core)
-            implementation(libs.slf4j.api)
+
+        getByName("desktopTest").dependencies {
+            // JediTerm logs through slf4j; silence it in tests only (apps bind slf4j-nop themselves).
+            runtimeOnly(libs.slf4j.nop)
         }
     }
 }

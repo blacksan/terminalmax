@@ -21,8 +21,12 @@ java {
 dependencies {
     implementation(projects.core.designsystem)
     implementation(projects.feature.proof)
+    // Not referenced by the proof UI yet; listed so desktop packaging sees the SSH module.
+    implementation(projects.core.ssh)
     implementation(compose.desktop.currentOs)
     implementation(libs.kotlinx.coroutines.swing)
+    // Explicit slf4j binding: terminal output and SSH details must never reach a logger by accident.
+    runtimeOnly(libs.slf4j.nop)
 }
 
 compose.desktop {

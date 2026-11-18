@@ -21,6 +21,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -84,10 +85,10 @@ fun ProofScreen() {
 /** Terminal spike: shared Canvas renderer over the JediTerm-backed engine, with local echo. */
 @Composable
 private fun TerminalSection() {
-    val engine = remember {
-        createTerminalEngine(cols = 80, rows = 12).also { it.feed(terminalDemoBytes()) }
-    }
+    val engine = remember { createTerminalEngine(cols = 80, rows = 12) }
     DisposableEffect(engine) { onDispose { engine.close() } }
+    // Feed the canned output from an effect, never during composition.
+    LaunchedEffect(engine) { engine.feed(terminalDemoBytes()) }
     Text("Terminal", style = MaterialTheme.typography.titleMedium)
     TerminalView(
         engine = engine,

@@ -65,12 +65,17 @@ object XtermKeyEncoder {
         if (hasMods(m)) "$ESC[1;${param(m)}$final" else "${ESC}O$final"
 
     /**
-     * Encodes a typed character. Ctrl+letter yields the C0 control code (Ctrl+C = 0x03), Alt adds an
-     * ESC prefix. Returns null for code points that must not be sent (controls, DEL, invalid).
+     * Encodes a character. Ctrl+letter yields the C0 control code (Ctrl+C = 0x03), Alt adds an
+     * ESC prefix. Returns null for code points that must not be sent: non-characters (U+FFFF,
+     * U+FFFE, U+FDD0..FDEF, ...), surrogates, controls and DEL.
+     *
+     * With Ctrl, already-translated control codes (AWT delivers Ctrl+@ as 0 and Ctrl+\ ] ^ _ as
+     * 0x1c..0x1f) are accepted, and Ctrl+8 -> 0x7f, Ctrl+` -> 0x00 follow xterm.
      */
     fun encodeCodePoint(codePoint: Int, m: KeyModifiers = KeyModifiers.None): ByteArray? {
         val cp = codePoint
-        if (cp <= 0 || cp > 0x10FFFF || (cp in 0xD800..0xDFFF)) return null
+        if (KeyboardInput.isNonCharacter(cp)) return null
+        if (cp == 0 && !m.ctrl) return null
         val out = ArrayList<Byte>(8)
         if (m.alt) out.add(0x1b)
         if (m.ctrl) {
@@ -78,13 +83,14 @@ object XtermKeyEncoder {
                 in 'a'.code..'z'.code -> cp - 'a'.code + 1
                 in 'A'.code..'Z'.code -> cp - 'A'.code + 1
                 in 1..26 -> cp
-                ' '.code, '@'.code, '2'.code -> 0
+                0, ' '.code, '@'.code, '2'.code, '`'.code -> 0
                 '['.code, '3'.code -> 0x1b
                 '\\'.code, '4'.code -> 0x1c
                 ']'.code, '5'.code -> 0x1d
                 '^'.code, '6'.code -> 0x1e
                 '_'.code, '/'.code, '7'.code -> 0x1f
-                '?'.code -> 0x7f
+                in 0x1c..0x1f -> cp
+                '8'.code, '?'.code -> 0x7f
                 else -> -1
             }
             if (ctrl >= 0) {
