@@ -34,6 +34,16 @@ class KmpLibraryConventionPlugin : Plugin<Project> {
                 compilerOptions.jvmTarget.set(JvmTarget.JVM_17)
             }
 
+            // Print full failure details on the console: CI logs are the only place test output is read.
+            tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+                testLogging {
+                    events("failed")
+                    exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+                    showCauses = true
+                    showStackTraces = true
+                }
+            }
+
             // Keep javac and the published org.gradle.jvm.version attribute at 17 so :desktopApp (Java 17)
             // can consume the desktop variant.
             pluginManager.withPlugin("java-base") {
