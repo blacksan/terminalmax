@@ -156,6 +156,15 @@ class WebDavStoreTest {
     }
 
     @Test
+    fun probeLeavesRecentScratchFilesOfOtherDevicesAlone() = runBlocking<Unit> {
+        val s = server()
+        val recent = "terminalmax.probe-" + (System.currentTimeMillis() / 1000).toString(16).padStart(8, '0') + "abcdef01"
+        s.files[recent] = byteArrayOf(1)
+        store(s).probe()
+        assertTrue(s.files.containsKey(recent), "a probe that may still be in flight on another device must survive")
+    }
+
+    @Test
     fun probeNeverTouchesTheVaultFile() = runBlocking<Unit> {
         val s = server()
         s.files[FakeDavServer.VAULT] = byteArrayOf(1, 2, 3)

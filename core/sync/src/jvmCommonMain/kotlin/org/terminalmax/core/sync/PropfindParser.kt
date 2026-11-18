@@ -103,6 +103,8 @@ object PropfindParser {
                     }
                 }
                 "href", "getetag" -> if (!closing && !selfClosing) {
+                    // An unterminated CDATA section can never end later either: stop for good (keeps the scan linear).
+                    if (xml.startsWith("<![CDATA[", i) && xml.indexOf("]]>", i + 9) < 0) break
                     val read = readText(xml, i)
                     if (read != null) {
                         i = read.second

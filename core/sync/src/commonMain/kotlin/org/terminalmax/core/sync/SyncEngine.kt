@@ -9,7 +9,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.terminalmax.core.vault.MAX_REVISION
+import org.terminalmax.core.vault.MAX_REVISION_JUMP
 import org.terminalmax.core.vault.MergeSide
+import org.terminalmax.core.vault.REVISION_HEADROOM
 import org.terminalmax.core.vault.VaultContent
 import org.terminalmax.core.vault.VaultException
 import org.terminalmax.core.vault.mergeVaults
@@ -21,7 +23,10 @@ import org.terminalmax.core.vault.mergeVaults
  * with [SyncOptions.recreateRemote]); otherwise decrypt it, check it against the floors this device remembers (key
  * epoch, slot-set revision, content revision, file digests), merge it with the local content and the stored base,
  * and upload the result when it differs from the remote. The merge keeps the highest version of every record, so a
- * stale or replayed remote can never revert an edit; it is reported as a [SyncWarning.StaleRemoteIgnored] instead.
+ * stale or replayed remote can never revert an edit; a lower version that is not provably one this device saw
+ * before is never dropped silently, it goes to the vault history and is reported as a conflict (see `mergeVaults`).
+ * A remote whose revision jumps implausibly far above what this device has seen is refused
+ * ([FailureReason.SuspiciousRevisionJump]).
  * Uploads are made atomic with `If-Match` / `If-None-Match` when the server was measured to honour them, otherwise
  * under a lock-file lease. Every upload is read back and must be byte-for-byte what was written, otherwise
  * another writer got in between and the attempt is repeated (at most [maxAttempts], with jittered backoff).
@@ -51,15 +56,34 @@ class SyncEngine(
 ) {
     private sealed interface Step {
         class Done(val result: SyncResult) : Step
-        class Fail(val reason: FailureReason, val detail: String? = null) : Step
+        class Fail(
+            val reason: FailureReason,
+            val detail: String? = null,
+            val warnings: List<SyncWarning> = emptyList(),
+        ) : Step
         class Retry(val reason: FailureReason, val forceLock: Boolean = false) : Step
     }
 
     private val mutex = Mutex()
 
-    suspend fun sync(local: VaultContent, options: SyncOptions = SyncOptions()): SyncResult {
+    /**
+     * Synchronises [local] with the remote file.
+     *
+     * @param staged a password change prepared with the hooks, published as one transaction: the remote file must be
+     *   byte-identical to the base this device last synced (otherwise [FailureReason.HeaderChangedRemotely] or
+     *   [FailureReason.RemoteChangedDuringRotation], nothing uploaded), the re-keyed file is uploaded and read back,
+     *   and only then is the change committed locally together with the new sync state
+     * @param reopenPassword the master password, used only when the remote file turns out to be at a higher key
+     *   epoch (the vault was re-keyed elsewhere); without it that case fails with [FailureReason.ReopenRequired]
+     */
+    suspend fun sync(
+        local: VaultContent,
+        options: SyncOptions = SyncOptions(),
+        staged: StagedHeaderChange? = null,
+        reopenPassword: CharArray? = null,
+    ): SyncResult {
         try {
-            return mutex.withLock { localState.exclusive { syncLocked(local, options) } }
+            return mutex.withLock { localState.exclusive { syncLocked(local, options, staged, reopenPassword) } }
         } catch (e: CancellationException) {
             throw e
         } catch (e: VaultException) {
@@ -75,7 +99,12 @@ class SyncEngine(
         }
     }
 
-    private suspend fun syncLocked(local: VaultContent, options: SyncOptions): SyncResult {
+    private suspend fun syncLocked(
+        local: VaultContent,
+        options: SyncOptions,
+        staged: StagedHeaderChange?,
+        reopenPassword: CharArray?,
+    ): SyncResult {
         try {
             local.validate()
         } catch (e: VaultException.InvalidContent) {
@@ -86,9 +115,9 @@ class SyncEngine(
         var lastReason = FailureReason.TooManyAttempts
         for (attempt in 1..maxAttempts) {
             if (attempt > 1) sleep(backoffMillis(attempt))
-            when (val step = attemptOnce(local, capabilities, forceLock, options)) {
+            when (val step = attemptOnce(local, capabilities, forceLock, options, staged, reopenPassword)) {
                 is Step.Done -> return step.result
-                is Step.Fail -> return failed(local, step.reason, step.detail)
+                is Step.Fail -> return failed(local, step.reason, step.detail, step.warnings)
                 is Step.Retry -> {
                     lastReason = step.reason
                     if (step.forceLock) forceLock = true
@@ -108,8 +137,12 @@ class SyncEngine(
         else -> FailureReason.InvalidRemoteFile
     }
 
-    private fun failed(local: VaultContent, reason: FailureReason, detail: String?) =
-        SyncResult(SyncOutcome.Failed(reason, detail), local)
+    private fun failed(
+        local: VaultContent,
+        reason: FailureReason,
+        detail: String?,
+        warnings: List<SyncWarning> = emptyList(),
+    ) = SyncResult(SyncOutcome.Failed(reason, detail), local, warnings)
 
     private fun backoffMillis(attempt: Int): Long {
         val cap = 100L shl (attempt - 1).coerceAtMost(6)
@@ -146,14 +179,18 @@ class SyncEngine(
         updateServer { it.copy(capabilities = null, probedAtEpochMs = 0L) }
     }
 
+    /**
+     * Records a successful sync: floors, digests, the base file and (in the same save, so they cannot diverge) the
+     * sealed local file when [localFile] is given.
+     */
     private suspend fun recordSynced(
         vaultId: String,
         file: ByteArray,
+        localFile: ByteArray?,
         keyEpoch: Long,
         headerRevision: Long,
         revision: Long,
         digest: String,
-        etag: String?,
         seenRemote: Pair<Long, String>?,
     ) {
         val state = localState.load()
@@ -164,16 +201,22 @@ class SyncEngine(
             val keep = digests.keys.sorted().takeLast(VaultSyncState.MAX_DIGESTS).toSet()
             digests = digests.filterKeys { it in keep }
         }
-        val updated = VaultSyncState(
+        val updated = previous.copy(
             baseFile = file,
+            localFile = localFile ?: previous.localFile,
             highestRevision = maxOf(previous.highestRevision, revision),
             highestKeyEpoch = maxOf(previous.highestKeyEpoch, keyEpoch),
             highestHeaderRevision = maxOf(previous.highestHeaderRevision, headerRevision),
             fileDigests = digests,
         )
-        val key = store.serverKey
-        val server = (state.servers[key] ?: ServerSyncState()).copy(lastEtag = etag)
-        localState.save(state.copy(vaults = state.vaults + (vaultId to updated), servers = state.servers + (key to server)))
+        localState.save(state.copy(vaults = state.vaults + (vaultId to updated)))
+    }
+
+    /** Persists only the sealed local file (after a re-key was adopted, before the sync that follows). */
+    private suspend fun recordLocalFile(vaultId: String, localFile: ByteArray) {
+        val state = localState.load()
+        val previous = state.vaults[vaultId] ?: VaultSyncState()
+        localState.save(state.copy(vaults = state.vaults + (vaultId to previous.copy(localFile = localFile))))
     }
 
     // ------------------------------------------------------------------ one attempt
@@ -183,6 +226,8 @@ class SyncEngine(
         capabilities: ServerCapabilities,
         forceLock: Boolean,
         options: SyncOptions,
+        staged: StagedHeaderChange?,
+        reopenPassword: CharArray?,
     ): Step {
         val needsLock = forceLock || !capabilities.supportsConditionalWrites
         var lease: Lease? = null
@@ -190,7 +235,7 @@ class SyncEngine(
             lease = acquireLock(capabilities) ?: return Step.Retry(FailureReason.Locked)
         }
         try {
-            return readMergeWrite(local, lease, capabilities, options)
+            return readMergeWrite(local, lease, capabilities, options, staged, reopenPassword)
         } finally {
             lease?.let { releaseLock(it) }
         }
@@ -210,6 +255,8 @@ class SyncEngine(
         lease: Lease?,
         capabilities: ServerCapabilities,
         options: SyncOptions,
+        staged: StagedHeaderChange?,
+        reopenPassword: CharArray?,
     ): Step {
         val underLock = lease != null
         val state = localState.load()
@@ -223,8 +270,12 @@ class SyncEngine(
         val floorEpoch = maxOf(vs.highestKeyEpoch, baseInfo?.keyEpoch ?: 0L)
         val floorHeader = maxOf(vs.highestHeaderRevision, baseInfo?.headerRevision ?: 0L)
         val established = vs.established
+        val warnings = ArrayList<SyncWarning>()
 
         if (remote == null) {
+            if (staged != null) {
+                return Step.Fail(FailureReason.RemoteMissing, "a password change needs an existing remote file")
+            }
             if (established && !options.recreateRemote) {
                 return Step.Fail(FailureReason.RemoteMissing, "the remote vault file no longer exists")
             }
@@ -240,17 +291,46 @@ class SyncEngine(
             } else {
                 local
             }
-            val enc = hooks.encrypt(toPush, null)
+            val enc = hooks.encrypt(toPush)
             val result = store.write(
                 enc.bytes,
                 ifMatchEtag = null,
                 ifNoneMatch = !underLock || capabilities.honoursIfNoneMatchStar,
             )
-            val warnings = if (established) listOf(SyncWarning.RemoteRecreated(toPush.revision)) else emptyList()
-            return afterWrite(result, enc, toPush, SyncOutcome.Pushed, warnings, underLock, null)
+            if (established) warnings += SyncWarning.RemoteRecreated(toPush.revision)
+            return afterWrite(result, enc, toPush, SyncOutcome.Pushed, warnings, underLock, null, null)
         }
 
-        val info = hooks.decrypt(remote.bytes)
+        // A file at a higher key epoch means the vault was re-keyed (a password change somewhere). Check the chain
+        // link with the key we hold; the password is needed to go on.
+        val info = try {
+            hooks.decrypt(remote.bytes)
+        } catch (e: VaultException.KeyEpochMismatch) {
+            if (e.found <= e.expected) throw e
+            if (staged != null) {
+                return Step.Fail(
+                    FailureReason.HeaderChangedRemotely,
+                    "the vault was re-keyed on another device (key epoch ${e.found})",
+                )
+            }
+            val chain = hooks.epochChain(remote.bytes)
+            val chainWarnings: List<SyncWarning> = if (chain == EpochChain.Verified) {
+                emptyList()
+            } else {
+                listOf(SyncWarning.KeyEpochChainUnverified(e.expected, e.found))
+            }
+            if (reopenPassword == null) {
+                return Step.Fail(FailureReason.ReopenRequired, "key epoch ${e.found} needs the master password", chainWarnings)
+            }
+            val reopened = hooks.reopen(remote.bytes, reopenPassword)
+            if (reopened.chain != EpochChain.Verified) {
+                warnings += SyncWarning.KeyEpochChainUnverified(e.expected, e.found)
+            }
+            // The key changed in memory: persist the local file under it right away, so that a restart can open it
+            // with the password that was just typed.
+            recordLocalFile(local.vaultId, hooks.sealLocal(local))
+            hooks.decrypt(remote.bytes)
+        }
         val remoteContent = info.content
         if (remoteContent.vaultId != local.vaultId) return Step.Fail(FailureReason.DifferentVault)
         if (info.keyEpoch < floorEpoch) {
@@ -271,9 +351,17 @@ class SyncEngine(
                 "remote revision ${remoteContent.revision} is lower than the highest seen ($floorRevision)",
             )
         }
+        // A revision that jumps far above the floor could leave the vault permanently un-editable.
+        val tooHigh = remoteContent.revision > MAX_REVISION - REVISION_HEADROOM
+        val tooFar = established && remoteContent.revision > floorRevision && remoteContent.revision - floorRevision > MAX_REVISION_JUMP
+        if (tooHigh || tooFar) {
+            return Step.Fail(
+                FailureReason.SuspiciousRevisionJump,
+                "remote revision ${remoteContent.revision} is implausibly far above the highest seen ($floorRevision)",
+            )
+        }
 
         val digest = hooks.fingerprint(remote.bytes)
-        val warnings = ArrayList<SyncWarning>()
         val seenDigest = vs.fileDigests[remoteContent.revision]
         if (seenDigest != null && seenDigest != digest) {
             warnings += SyncWarning.ForkSuspected(remoteContent.revision)
@@ -282,35 +370,33 @@ class SyncEngine(
             warnings += SyncWarning.FirstUseTrust(remoteContent.revision, info.keyEpoch, info.headerRevision)
         }
 
+        if (staged != null) {
+            return publishStaged(local, staged, remote, info, remoteContent, vs, base, floorRevision, lease, warnings)
+        }
+
         val merge = mergeVaults(base, local, remoteContent, deviceId)
         val staleRemote = merge.regressions.filter { it.ignoredSide == MergeSide.Remote }.map { it.recordId }
         if (staleRemote.isNotEmpty()) warnings += SyncWarning.StaleRemoteIgnored(staleRemote)
         val staleLocal = merge.regressions.filter { it.ignoredSide == MergeSide.Local }.map { it.recordId }
         if (staleLocal.isNotEmpty()) warnings += SyncWarning.LocalContentWasStale(staleLocal)
 
-        // A local slot change or key rotation must be published even when the content is unchanged.
-        val headerPush = hooks.keyEpoch > info.keyEpoch ||
-            (hooks.keyEpoch == info.keyEpoch && hooks.headerRevision > info.headerRevision)
         val outcome = when {
             merge.conflicts.isNotEmpty() -> SyncOutcome.Merged(merge.conflicts)
             merge.changedLocally && merge.changedRemotely -> SyncOutcome.Merged(emptyList())
-            merge.changedRemotely || headerPush -> SyncOutcome.Pushed
+            merge.changedRemotely -> SyncOutcome.Pushed
             merge.changedLocally -> SyncOutcome.Pulled
             else -> SyncOutcome.UpToDate
         }
 
-        if (!merge.changedRemotely && !headerPush) {
+        if (!merge.changedRemotely) {
             recordSynced(
-                local.vaultId, remote.bytes, info.keyEpoch, info.headerRevision,
-                remoteContent.revision, digest, usableEtag(remote.etag), null,
+                local.vaultId, remote.bytes, hooks.sealLocal(merge.merged), info.keyEpoch, info.headerRevision,
+                remoteContent.revision, digest, null,
             )
             return Step.Done(SyncResult(outcome, merge.merged, warnings))
         }
 
         var toWrite = merge.merged
-        if (!merge.changedRemotely) {
-            toWrite = toWrite.copy(revision = nextRevision(maxOf(local.revision, remoteContent.revision)))
-        }
         if (toWrite.revision <= floorRevision) toWrite = toWrite.copy(revision = nextRevision(floorRevision))
 
         val etag = usableEtag(remote.etag)
@@ -320,12 +406,57 @@ class SyncEngine(
         }
         if (lease != null && !renewLease(lease)) return Step.Retry(FailureReason.Locked)
 
-        val enc = hooks.encrypt(toWrite, remote.bytes)
+        val enc = hooks.encrypt(toWrite)
         val result = store.write(enc.bytes, ifMatchEtag = if (underLock) null else etag, ifNoneMatch = false)
-        return afterWrite(result, enc, toWrite, outcome, warnings, underLock, remoteContent.revision to digest)
+        return afterWrite(result, enc, toWrite, outcome, warnings, underLock, remoteContent.revision to digest, null)
     }
 
-    /** Verifies an upload by reading it back; records the new sync state only when the bytes are exactly ours. */
+    /**
+     * The password-change transaction (see [sync]). The remote file must be byte-identical to the stored base, so
+     * nothing written at the old key epoch after the last sync is carried into the new epoch unreported.
+     */
+    private suspend fun publishStaged(
+        local: VaultContent,
+        staged: StagedHeaderChange,
+        remote: RemoteFile,
+        info: DecryptedVault,
+        remoteContent: VaultContent,
+        vs: VaultSyncState,
+        base: VaultContent?,
+        floorRevision: Long,
+        lease: Lease?,
+        warnings: List<SyncWarning>,
+    ): Step {
+        val underLock = lease != null
+        val baseFile = vs.baseFile
+        if (baseFile == null || !remote.bytes.contentEquals(baseFile)) {
+            return if (info.keyEpoch != staged.baseKeyEpoch || info.headerRevision != staged.baseHeaderRevision) {
+                Step.Fail(FailureReason.HeaderChangedRemotely, "the key slots changed on another device")
+            } else {
+                Step.Fail(
+                    FailureReason.RemoteChangedDuringRotation,
+                    "the remote vault changed since the last sync; sync first, then repeat the password change",
+                )
+            }
+        }
+        val merge = mergeVaults(base, local, remoteContent, deviceId)
+        var toWrite = merge.merged
+        toWrite = toWrite.copy(revision = nextRevision(maxOf(toWrite.revision, remoteContent.revision, floorRevision)))
+        val etag = usableEtag(remote.etag)
+        if (!underLock && etag == null) return Step.Retry(FailureReason.TooManyAttempts, forceLock = true)
+        if (lease != null && !renewLease(lease)) return Step.Retry(FailureReason.Locked)
+        val enc = hooks.encryptStaged(toWrite, staged)
+        val result = store.write(enc.bytes, ifMatchEtag = if (underLock) null else etag, ifNoneMatch = false)
+        return afterWrite(
+            result, enc, toWrite, SyncOutcome.Pushed, warnings, underLock,
+            remoteContent.revision to hooks.fingerprint(remote.bytes), staged,
+        )
+    }
+
+    /**
+     * Verifies an upload by reading it back; records the new sync state (and, for [staged], commits the header
+     * change) only when the bytes are exactly ours.
+     */
     private suspend fun afterWrite(
         result: WriteResult,
         enc: EncryptedVault,
@@ -334,6 +465,7 @@ class SyncEngine(
         warnings: List<SyncWarning>,
         underLock: Boolean,
         seenRemote: Pair<Long, String>?,
+        staged: StagedHeaderChange?,
     ): Step = when (result) {
         is WriteResult.PreconditionFailed -> Step.Retry(FailureReason.TooManyAttempts)
         is WriteResult.Failed -> Step.Fail(FailureReason.ServerRejected, result.message)
@@ -345,10 +477,12 @@ class SyncEngine(
                 if (!underLock) invalidateProbe()
                 Step.Retry(FailureReason.TooManyAttempts)
             } else {
+                val localFile = if (staged != null) hooks.sealLocalStaged(written, staged) else hooks.sealLocal(written)
                 recordSynced(
-                    written.vaultId, enc.bytes, enc.keyEpoch, enc.headerRevision, written.revision,
-                    hooks.fingerprint(enc.bytes), usableEtag(readBack.etag ?: result.etag), seenRemote,
+                    written.vaultId, enc.bytes, localFile, enc.keyEpoch, enc.headerRevision, written.revision,
+                    hooks.fingerprint(enc.bytes), seenRemote,
                 )
+                if (staged != null) hooks.commitStaged(staged)
                 Step.Done(SyncResult(outcome, written, warnings))
             }
         }

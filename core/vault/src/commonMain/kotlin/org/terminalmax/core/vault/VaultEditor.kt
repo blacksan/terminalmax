@@ -12,12 +12,16 @@ import kotlinx.serialization.json.JsonObject
  * @param clock source of the informational `updatedAtEpochMs` stamp (pass `System::currentTimeMillis`);
  *   it is never used for ordering.
  * @param newId generator for new record ids (random UUID v4 by default).
+ * @param revisionFloor the highest revision this device has ever synced; new revisions are above it even when
+ *   [content] is older (a crash or a second process can leave the local content behind the sync state). Without
+ *   it such an edit would be ranked below a version that is already on the server.
  */
 class VaultEditor(
     content: VaultContent,
     private val deviceId: String,
     private val clock: () -> Long = { 0L },
     private val newId: () -> String = { randomUuidV4() },
+    private val revisionFloor: Long = 0L,
 ) {
     init {
         require(deviceId.isNotEmpty() && deviceId.length <= VaultContent.MAX_ID_CHARS) { "Invalid device id" }
@@ -40,7 +44,7 @@ class VaultEditor(
         val updated = VaultRecord(
             id = recordId,
             type = type,
-            revision = nextRevision(maxOf(existing?.revision ?: 0L, content.revision)),
+            revision = nextRevision(maxOf(existing?.revision ?: 0L, content.revision, revisionFloor)),
             deviceId = deviceId,
             updatedAtEpochMs = clock(),
             deleted = false,
@@ -82,18 +86,19 @@ class VaultEditor(
     }
 
     /**
-     * Writes a tombstone for [id] (payload cleared so no secrets remain in the record). Returns null if the id
+     * Writes a tombstone for [id] (payload and unknown record-level fields cleared so no secrets remain in the record). Returns null if the id
      * is unknown. Deleting an already deleted record is a no-op returning the existing tombstone.
      */
     fun delete(id: String): VaultRecord? {
         val existing = content.records.firstOrNull { it.id == id } ?: return null
         if (existing.deleted) return existing
         val tombstone = existing.copy(
-            revision = nextRevision(maxOf(existing.revision, content.revision)),
+            revision = nextRevision(maxOf(existing.revision, content.revision, revisionFloor)),
             deviceId = deviceId,
             updatedAtEpochMs = clock(),
             deleted = true,
             payload = VaultJson.emptyObject,
+            extra = VaultJson.emptyObject, // unknown record-level fields of newer versions may hold secrets too
         )
         store(tombstone)
         return tombstone

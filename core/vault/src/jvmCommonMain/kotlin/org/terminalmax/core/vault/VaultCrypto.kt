@@ -7,21 +7,21 @@ import java.security.GeneralSecurityException
 import java.security.SecureRandom
 import java.text.Normalizer
 import javax.crypto.Cipher
+import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
-import org.bouncycastle.crypto.agreement.X25519Agreement
 import org.bouncycastle.crypto.digests.SHA256Digest
 import org.bouncycastle.crypto.generators.Argon2BytesGenerator
 import org.bouncycastle.crypto.generators.HKDFBytesGenerator
 import org.bouncycastle.crypto.params.Argon2Parameters
 import org.bouncycastle.crypto.params.HKDFParameters
-import org.bouncycastle.crypto.params.X25519PrivateKeyParameters
-import org.bouncycastle.crypto.params.X25519PublicKeyParameters
 
 /**
- * Primitive operations of the vault format. BouncyCastle's lightweight API is used for Argon2id, HKDF-SHA-256 and
- * X25519 so nothing depends on which JCA providers a platform ships (Android has no portable "X25519" provider
- * before API 33); AES-256-GCM goes through the platform JCA.
+ * Primitive operations of the vault format. BouncyCastle's lightweight API is used for Argon2id and HKDF-SHA-256 so
+ * nothing depends on which JCA providers a platform ships; AES-256-GCM and HMAC-SHA-256 go through the platform JCA.
+ *
+ * Key hygiene is best effort: the `ByteArray`s this code creates are zeroed after use, but the JCA (`SecretKeySpec`,
+ * `Cipher`) and BouncyCastle keep their own internal copies of key material that nothing here can wipe.
  */
 internal object VaultCrypto {
     const val KEY_BYTES = 32
@@ -106,28 +106,11 @@ internal object VaultCrypto {
         return out
     }
 
-    /** X25519 key pair as (public, private) raw 32-byte encodings. */
-    fun generateX25519(): Pair<ByteArray, ByteArray> {
-        val priv = X25519PrivateKeyParameters(random)
-        val pub = priv.generatePublicKey()
-        return pub.encoded to priv.encoded
-    }
-
-    /** X25519 shared secret (32 bytes). Fails for malformed keys and low-order peer points. */
-    fun x25519(privateKey: ByteArray, peerPublicKey: ByteArray): ByteArray {
-        if (privateKey.size != KEY_BYTES || peerPublicKey.size != KEY_BYTES) {
-            throw GeneralSecurityException("X25519 keys are 32 bytes")
-        }
-        val agreement = X25519Agreement()
-        agreement.init(X25519PrivateKeyParameters(privateKey))
-        val out = ByteArray(agreement.agreementSize)
-        try {
-            agreement.calculateAgreement(X25519PublicKeyParameters(peerPublicKey), out, 0)
-        } catch (e: IllegalStateException) {
-            out.fill(0)
-            throw GeneralSecurityException("X25519 agreement failed")
-        }
-        return out
+    /** HMAC-SHA-256. */
+    fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(key, "HmacSHA256"))
+        return mac.doFinal(data)
     }
 
     fun gcmEncrypt(key: ByteArray, nonce: ByteArray, aad: ByteArray, plaintext: ByteArray): ByteArray {

@@ -5,6 +5,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
 import org.terminalmax.core.vault.HostPayload
 import org.terminalmax.core.vault.KdfParams
 import org.terminalmax.core.vault.VaultCodec
@@ -26,13 +27,15 @@ class OpenVaultCodecHooksTest {
         val vault = VaultCodec.create("pw".toCharArray(), fast)
         OpenVaultCodecHooks(vault).use { hooks ->
             val content = contentWithHost(vault.content)
-            val encrypted = hooks.encrypt(content, null)
+            val encrypted = hooks.encrypt(content)
             assertEquals(1L, encrypted.keyEpoch)
             assertEquals(1L, encrypted.headerRevision)
             val decrypted = hooks.decrypt(encrypted.bytes)
             assertEquals(content, decrypted.content)
             assertEquals(1L, decrypted.keyEpoch)
             assertEquals(1L, decrypted.headerRevision)
+            // The local file is the same kind of file under the same key.
+            assertEquals(content, hooks.decrypt(hooks.sealLocal(content)).content)
         }
     }
 
@@ -53,67 +56,85 @@ class OpenVaultCodecHooksTest {
     }
 
     @Test
-    fun aKeyRotationKeepsTheOldKeyUntilACurrentFileHasBeenRead() {
+    fun aStagedPasswordChangeChangesNothingUntilItIsCommittedAndThenZeroesTheOldKey() {
         val vault = VaultCodec.create("pw".toCharArray(), fast)
-        val stale = OpenVaultCodecHooks(vault)
         OpenVaultCodecHooks(vault).use { hooks ->
             val content = contentWithHost(vault.content)
-            val old = hooks.encrypt(content, null)
+            val old = hooks.encrypt(content)
+            val staged = hooks.stage { VaultCodec.changePassword(it, "new".toCharArray()) }
+            assertEquals(1L, hooks.keyEpoch)
+            assertEquals(1L, staged.baseKeyEpoch)
+            assertEquals(2L, staged.keyEpoch)
+            assertEquals(1L, hooks.decrypt(hooks.encrypt(content).bytes).keyEpoch, "still writes the old epoch")
 
-            hooks.replaceVault(VaultCodec.changePassword(vault, "new".toCharArray()))
+            val fresh = hooks.encryptStaged(content, staged)
+            assertEquals(2L, fresh.keyEpoch)
+            assertEquals(EpochChain.Verified, hooks.epochChain(fresh.bytes))
+
+            hooks.commitStaged(staged)
             assertEquals(2L, hooks.keyEpoch)
             assertEquals(2L, hooks.headerRevision)
-
-            // The file of the previous epoch can still be read once (to merge it), then the new file is written.
-            assertEquals(content, hooks.decrypt(old.bytes).content)
-            val fresh = hooks.encrypt(content, old.bytes)
-            assertEquals(2L, fresh.keyEpoch)
-            assertEquals(2L, fresh.headerRevision)
-
-            // Reading a file of the current epoch drops the old key: replays of the old epoch are refused.
             assertEquals(content, hooks.decrypt(fresh.bytes).content)
+            // The superseded key is gone: the old epoch is a replay now.
             val replay = assertFailsWith<VaultException.KeyEpochMismatch> { hooks.decrypt(old.bytes) }
             assertEquals(1L, replay.found)
             assertEquals(2L, replay.expected)
-
-            // A device that never saw the rotation cannot read the new file and learns that it must re-open.
-            val newer = assertFailsWith<VaultException.KeyEpochMismatch> { stale.decrypt(fresh.bytes) }
-            assertEquals(2L, newer.found)
-            assertEquals(1L, newer.expected)
+            assertFailsWith<IllegalStateException> { hooks.commitStaged(staged) }
         }
-        stale.close()
     }
 
     @Test
-    fun anUploadKeepsTheNewerHeaderOfTheFileItReplaces() {
+    fun aDiscardedStagedChangeLeavesTheHeldVaultUntouched() {
         val vault = VaultCodec.create("pw".toCharArray(), fast)
-        val pair = VaultCodec.generateDeviceKeyPair()
-        val withSlot = VaultCodec.addDeviceSlot(vault, pair.publicKey)
+        OpenVaultCodecHooks(vault).use { hooks ->
+            val staged = hooks.stage { VaultCodec.changePassword(it, "new".toCharArray()) }
+            staged.discard()
+            assertEquals(1L, hooks.keyEpoch)
+            hooks.encrypt(contentWithHost(vault.content)) // the held key still works
+        }
+    }
+
+    @Test
+    fun aDeviceThatNeverSawTheRotationNeedsThePasswordAndHoldsTheNewKeyAfterwards() {
+        val vault = VaultCodec.create("pw".toCharArray(), fast)
+        val content = contentWithHost(vault.content)
+        val staleHooks = OpenVaultCodecHooks(vault)
+        OpenVaultCodecHooks(vault).use { hooks ->
+            val staged = hooks.stage { VaultCodec.changePassword(it, "new".toCharArray()) }
+            val file = hooks.encryptStaged(content, staged).bytes
+            hooks.commitStaged(staged)
+
+            val newer = assertFailsWith<VaultException.KeyEpochMismatch> { staleHooks.decrypt(file) }
+            assertEquals(2L, newer.found)
+            assertEquals(1L, newer.expected)
+            assertEquals(EpochChain.Verified, staleHooks.epochChain(file))
+            assertFailsWith<VaultException.BadPasswordOrCorrupt> { staleHooks.reopen(file, "wrong".toCharArray()) }
+            assertEquals(1L, staleHooks.keyEpoch)
+            assertEquals(EpochChain.Verified, staleHooks.reopen(file, "new".toCharArray()).chain)
+            assertEquals(2L, staleHooks.keyEpoch)
+            assertEquals(content, staleHooks.decrypt(file).content)
+        }
+        staleHooks.close()
+    }
+
+    @Test
+    fun decryptingANewerHeaderOfTheSameEpochAdoptsItAndAnOlderOneIsNotAdopted() {
+        val vault = VaultCodec.create("pw".toCharArray(), fast)
+        val withSlot = VaultCodec.addPasswordSlot(vault, "second".toCharArray(), fast)
         OpenVaultCodecHooks(vault).use { behind ->
             OpenVaultCodecHooks(withSlot).use { ahead ->
                 val content = contentWithHost(vault.content)
-                val remote = ahead.encrypt(content, null)
+                val remote = ahead.encrypt(content)
                 assertEquals(2L, remote.headerRevision)
-                // `behind` has header revision 1 but must not undo the slot that is already on the server.
-                val next = behind.encrypt(content, remote.bytes)
-                assertEquals(2L, next.headerRevision)
+                assertEquals(1L, behind.headerRevision)
+                behind.decrypt(remote.bytes)
+                assertEquals(2L, behind.headerRevision, "the authenticated newer header is adopted on every read")
+                assertEquals(2, VaultCodec.inspect(behind.encrypt(content).bytes).slots.size)
+                // An older header does not replace the held one.
+                val old = VaultCodec.seal(vault.withContent(content))
+                behind.decrypt(old)
                 assertEquals(2L, behind.headerRevision)
-                assertEquals(2, VaultCodec.inspect(next.bytes).slots.size)
             }
-        }
-    }
-
-    @Test
-    fun aLocalHeaderNewerThanTheRemoteOneWins() {
-        val vault = VaultCodec.create("pw".toCharArray(), fast)
-        val pair = VaultCodec.generateDeviceKeyPair()
-        OpenVaultCodecHooks(vault).use { hooks ->
-            val content = contentWithHost(vault.content)
-            val remote = hooks.encrypt(content, null)
-            hooks.replaceVault(VaultCodec.addDeviceSlot(vault, pair.publicKey))
-            val next = hooks.encrypt(content, remote.bytes)
-            assertEquals(2L, next.headerRevision)
-            assertEquals(2, VaultCodec.inspect(next.bytes).slots.size)
         }
     }
 
@@ -123,9 +144,18 @@ class OpenVaultCodecHooksTest {
         val two = VaultCodec.create("pw".toCharArray(), fast)
         OpenVaultCodecHooks(one).use { a ->
             OpenVaultCodecHooks(two).use { b ->
-                val file = b.encrypt(two.content, null)
+                val file = b.encrypt(two.content)
                 assertFailsWith<VaultException.DifferentVault> { a.decrypt(file.bytes) }
             }
         }
+    }
+
+    @Test
+    fun closedHooksZeroTheirKeyAndRefuseToWork() {
+        val vault = VaultCodec.create("pw".toCharArray(), fast)
+        val hooks = OpenVaultCodecHooks(vault)
+        hooks.close()
+        assertFailsWith<IllegalStateException> { hooks.encrypt(vault.content) }
+        assertTrue(true)
     }
 }

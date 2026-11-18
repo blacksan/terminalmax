@@ -6,11 +6,15 @@ class LocalStateException(message: String, cause: Throwable? = null) : Exception
 
 /**
  * What a device remembers about one vault between syncs. It holds no secrets: [baseFile] is the encrypted file
- * exactly as it was last synced (the three-way merge base is decrypted from it with the data key when needed).
+ * exactly as it was last synced (the three-way merge base is decrypted from it with the data key when needed) and
+ * [localFile] is the sealed local vault. They live in the same on-disk transaction (see `VaultSession`), so the
+ * floors, the base and the local content can never diverge after a crash.
  *
  * The "highest" values are floors: a remote file below any of them is a rollback or a replay.
  *
  * @property baseFile the vault file as of the last successful sync, or null
+ * @property localFile this device's own sealed vault file (its current local content), or null when the state is
+ *   used without a `VaultSession`
  * @property highestRevision highest content revision ever read from or written to the remote
  * @property highestKeyEpoch highest key epoch seen
  * @property highestHeaderRevision highest slot-set revision seen
@@ -19,6 +23,7 @@ class LocalStateException(message: String, cause: Throwable? = null) : Exception
  */
 data class VaultSyncState(
     val baseFile: ByteArray? = null,
+    val localFile: ByteArray? = null,
     val highestRevision: Long = 0L,
     val highestKeyEpoch: Long = 0L,
     val highestHeaderRevision: Long = 0L,
@@ -34,11 +39,13 @@ data class VaultSyncState(
             highestKeyEpoch == other.highestKeyEpoch &&
             highestHeaderRevision == other.highestHeaderRevision &&
             fileDigests == other.fileDigests &&
-            (baseFile?.contentEquals(other.baseFile) ?: (other.baseFile == null))
+            (baseFile?.contentEquals(other.baseFile) ?: (other.baseFile == null)) &&
+            (localFile?.contentEquals(other.localFile) ?: (other.localFile == null))
     }
 
     override fun hashCode(): Int {
         var result = baseFile?.contentHashCode() ?: 0
+        result = 31 * result + (localFile?.contentHashCode() ?: 0)
         result = 31 * result + highestRevision.hashCode()
         result = 31 * result + highestKeyEpoch.hashCode()
         result = 31 * result + highestHeaderRevision.hashCode()
@@ -58,12 +65,10 @@ data class VaultSyncState(
 /**
  * What a device remembers about one server (see [RemoteStore.serverKey]).
  *
- * @property lastEtag the (usable) ETag of the vault file as of the last successful sync
  * @property capabilities result of the last probe of this server, valid for [SyncEngine]'s re-probe interval
  * @property probedAtEpochMs local clock time of that probe
  */
 data class ServerSyncState(
-    val lastEtag: String? = null,
     val capabilities: ServerCapabilities? = null,
     val probedAtEpochMs: Long = 0L,
 )
@@ -72,10 +77,13 @@ data class ServerSyncState(
  * @property vaults per vault id (floors and base follow the vault across servers on purpose: a vault restored on
  *   another server must not be older than what this device has already seen)
  * @property servers per [RemoteStore.serverKey]
+ * @property deviceId random id of this installation, used to attribute record versions (null until a
+ *   `VaultSession` created one)
  */
 data class LocalSyncState(
     val vaults: Map<String, VaultSyncState> = emptyMap(),
     val servers: Map<String, ServerSyncState> = emptyMap(),
+    val deviceId: String? = null,
 )
 
 /**
@@ -94,8 +102,11 @@ interface LocalStateStore {
     suspend fun <T> exclusive(block: suspend () -> T): T = block()
 }
 
-/** Keeps the state in memory only (tests, and callers that persist elsewhere). Rollback floors die with the process. */
-class InMemoryLocalStateStore(initial: LocalSyncState = LocalSyncState()) : LocalStateStore {
+/**
+ * Keeps the state in memory only. **Tests only**: it is `internal` so production code cannot use it, because the
+ * rollback floors would silently vanish with the process.
+ */
+internal class InMemoryLocalStateStore(initial: LocalSyncState = LocalSyncState()) : LocalStateStore {
     private var state: LocalSyncState = initial
 
     override suspend fun load(): LocalSyncState = state

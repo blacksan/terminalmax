@@ -39,10 +39,34 @@ enum class FailureReason {
     RemoteMissing,
 
     /**
-     * The remote file uses a newer data key (the vault key was rotated on another device). This device must
-     * re-open the vault through its own password or device slot before it can sync again.
+     * The remote file uses a newer data key (the vault key was re-keyed, which happens on every password change).
+     * This device needs the master password to continue: call sync again with it. The number in the file's header is
+     * not authenticated, so a server can claim this; the password prompt is the only effect, and a file that the
+     * password does not open is refused. The result's warnings say whether the re-key is linked to this device's
+     * key ([SyncWarning.KeyEpochChainUnverified] when it is not).
      */
     ReopenRequired,
+
+    /**
+     * A password change was prepared against a header that is no longer the remote one (another device changed the
+     * password or the slot set first). Nothing was uploaded and nothing changed locally; sync, then apply the change
+     * again.
+     */
+    HeaderChangedRemotely,
+
+    /**
+     * A password change found that the remote file differs from the last one this device synced (another device
+     * wrote content). Nothing was uploaded; the change is refused so that content written at the old key epoch is
+     * never imported silently into the new epoch. Run a normal sync (it reports what it imports), then repeat.
+     */
+    RemoteChangedDuringRotation,
+
+    /**
+     * The remote file's content revision is implausibly far above anything this device has seen (more than
+     * `MAX_REVISION_JUMP` above its floor, or within `REVISION_HEADROOM` of the revision limit). Such a file could
+     * leave the vault permanently un-editable, so it is not merged.
+     */
+    SuspiciousRevisionJump,
 
     /** The stored sync state is unreadable or cannot be written. Nothing was synced; the state was not reset. */
     LocalStateUnavailable,
@@ -76,10 +100,19 @@ sealed class SyncWarning {
     data class FirstUseTrust(val remoteRevision: Long, val keyEpoch: Long, val headerRevision: Long) : SyncWarning()
 
     /**
-     * The remote carried older versions of these records than this device already knew (a stale or replayed file).
-     * They were ignored and the newer versions were uploaded again. A hostile server may be behind it.
+     * The remote carried older versions of these records that this device provably saw before (they are in its
+     * history): a replayed file. They were ignored and the newer versions were uploaded again. A hostile server may
+     * be behind it. Older versions that this device cannot prove it saw are reported as conflicts instead.
      */
     data class StaleRemoteIgnored(val recordIds: List<String>) : SyncWarning()
+
+    /**
+     * The vault was re-keyed (key epoch [toEpoch] > [fromEpoch]) by a device that this one cannot link to its own key:
+     * the file is not the direct, correctly chained successor of the epoch this device held. It was opened with the
+     * master password, so only someone who knows the password could have made it, but tell the user that the vault
+     * was re-keyed by a device this one cannot verify.
+     */
+    data class KeyEpochChainUnverified(val fromEpoch: Long, val toEpoch: Long) : SyncWarning()
 
     /** A different file than the one seen before exists at this content [revision]: the server forked its history. */
     data class ForkSuspected(val revision: Long) : SyncWarning()
@@ -93,7 +126,7 @@ sealed class SyncWarning {
 
 /**
  * [content] is what the caller should now treat as its local vault content (unchanged on failure).
- * [warnings] is empty on failure.
+ * [warnings] is empty on failure, except that [FailureReason.ReopenRequired] carries the chain warning.
  */
 data class SyncResult(
     val outcome: SyncOutcome,

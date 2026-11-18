@@ -3,6 +3,7 @@ package org.terminalmax.core.sync
 
 import java.security.MessageDigest
 import java.security.SecureRandom
+import org.terminalmax.core.vault.EpochLinkStatus
 import org.terminalmax.core.vault.OpenVault
 import org.terminalmax.core.vault.VaultCodec
 import org.terminalmax.core.vault.VaultContent
@@ -10,24 +11,21 @@ import org.terminalmax.core.vault.VaultException
 
 /**
  * [VaultCodecHooks] backed by an [OpenVault] (which holds the data key). Remote files are opened with the data
- * key, so no password is needed during sync.
+ * key, so no password is needed during sync. Owned by `VaultSession`; not part of the public API.
  *
- * The hooks keep their own copy of the vault; the caller keeps ownership of the instance it passed in. After a
- * local slot change or key rotation (changePassword, addDeviceSlot, removeSlot) hand the result to
- * [replaceVault]: the next upload then carries the new header. After a rotation the previous key is kept (at most
- * [MAX_RETIRED] generations, in memory only) so the remote and base files of the old epoch can still be read and
- * merged once; it is dropped as soon as a file of the current epoch has been read.
+ * The hooks keep their own copy of the vault. They always hold the newest **authenticated** header they have read:
+ * when a file at the current key epoch has a header at least as new as the held one, it replaces the held one (within
+ * one epoch the slot set only grows, and the file is authenticated by the same key), so a device never writes back
+ * a stale header.
  *
- * Header selection on upload: when the file being replaced belongs to the same vault and key epoch and its header
- * revision is at least as new as the local one, its header (slots) is kept, so a slot change made on another
- * device is not undone. Otherwise the local header is written.
- *
- * Call [close] when finished; it zeroes every key copy held here.
+ * Key changes happen in exactly three places, each of which zeroes the superseded key right away: [reopen] (the
+ * vault was re-keyed elsewhere; opened with the password), [commitStaged] (a password change this device published)
+ * and [close]. Because a password change is committed only after the upload is confirmed, there is never an
+ * unpublished newer key to remember, and no old keys are retained.
  */
-class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoCloseable {
+internal class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoCloseable {
     private val lock = Any()
     private var current: OpenVault = vault.withContent(vault.content)
-    private val retired = ArrayList<OpenVault>()
     private val random = SecureRandom()
 
     override val keyEpoch: Long get() = synchronized(lock) { current.keyEpoch }
@@ -35,24 +33,20 @@ class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoCloseable {
     override val headerRevision: Long get() = synchronized(lock) { current.headerRevision }
 
     override fun decrypt(bytes: ByteArray): DecryptedVault = synchronized(lock) {
-        val info = VaultCodec.inspect(bytes)
-        val key = if (info.keyEpoch == current.keyEpoch) {
-            current
-        } else {
-            retired.firstOrNull { it.keyEpoch == info.keyEpoch }
-                ?: throw VaultException.KeyEpochMismatch(found = info.keyEpoch, expected = current.keyEpoch)
-        }
-        val opened = VaultCodec.openWithDataKey(bytes, key)
+        val opened = VaultCodec.openWithDataKey(bytes, current)
         try {
-            if (key === current) dropRetired()
+            if (opened.headerRevision >= current.headerRevision) {
+                val old = current
+                current = opened.withContent(old.content)
+                old.close()
+            }
             DecryptedVault(opened.content, opened.keyEpoch, opened.headerRevision)
         } finally {
             opened.close()
         }
     }
 
-    override fun encrypt(content: VaultContent, replacing: ByteArray?): EncryptedVault = synchronized(lock) {
-        if (replacing != null) adoptRemoteHeader(replacing)
+    override fun encrypt(content: VaultContent): EncryptedVault = synchronized(lock) {
         val toSeal = current.withContent(content)
         try {
             EncryptedVault(VaultCodec.seal(toSeal), toSeal.keyEpoch, toSeal.headerRevision)
@@ -60,6 +54,104 @@ class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoCloseable {
             toSeal.close()
         }
     }
+
+    override fun sealLocal(content: VaultContent): ByteArray = synchronized(lock) {
+        val toSeal = current.withContent(content)
+        try {
+            VaultCodec.seal(toSeal)
+        } finally {
+            toSeal.close()
+        }
+    }
+
+    override fun epochChain(bytes: ByteArray): EpochChain = synchronized(lock) {
+        when (VaultCodec.verifyEpochLink(bytes, current)) {
+            EpochLinkStatus.Verified -> EpochChain.Verified
+            EpochLinkStatus.Unverified -> EpochChain.Unverified
+            EpochLinkStatus.NotApplicable -> EpochChain.NotApplicable
+        }
+    }
+
+    override fun reopen(bytes: ByteArray, password: CharArray): ReopenResult = synchronized(lock) {
+        val opened = VaultCodec.open(bytes, password)
+        try {
+            if (opened.vaultId != current.vaultId) throw VaultException.DifferentVault()
+            if (opened.keyEpoch <= current.keyEpoch) throw VaultException.BadPasswordOrCorrupt()
+            val chain = epochChain(bytes)
+            val old = current
+            current = opened.withContent(old.content)
+            old.close()
+            ReopenResult(chain)
+        } finally {
+            opened.close()
+        }
+    }
+
+    // ---- staged password change
+
+    private class Staged(
+        val vault: OpenVault,
+        override val baseKeyEpoch: Long,
+        override val baseHeaderRevision: Long,
+    ) : StagedHeaderChange {
+        override val keyEpoch: Long get() = vault.keyEpoch
+        override val headerRevision: Long get() = vault.headerRevision
+        var committed = false
+
+        override fun discard() {
+            if (!committed) vault.close()
+        }
+    }
+
+    /**
+     * Prepares a header change: [build] receives a copy of the held vault and returns the changed one (for example
+     * `VaultCodec.changePassword`). Nothing is held or published until [commitStaged]; a failed or abandoned change
+     * is released with [StagedHeaderChange.discard].
+     */
+    fun stage(build: (OpenVault) -> OpenVault): StagedHeaderChange = synchronized(lock) {
+        val copy = current.withContent(current.content)
+        try {
+            Staged(build(copy), current.keyEpoch, current.headerRevision)
+        } finally {
+            copy.close()
+        }
+    }
+
+    private fun asStaged(change: StagedHeaderChange): Staged =
+        change as? Staged ?: throw IllegalArgumentException("Foreign staged change")
+
+    override fun encryptStaged(content: VaultContent, staged: StagedHeaderChange): EncryptedVault = synchronized(lock) {
+        val toSeal = asStaged(staged).vault.withContent(content)
+        try {
+            EncryptedVault(VaultCodec.seal(toSeal), toSeal.keyEpoch, toSeal.headerRevision)
+        } finally {
+            toSeal.close()
+        }
+    }
+
+    override fun sealLocalStaged(content: VaultContent, staged: StagedHeaderChange): ByteArray = synchronized(lock) {
+        val toSeal = asStaged(staged).vault.withContent(content)
+        try {
+            VaultCodec.seal(toSeal)
+        } finally {
+            toSeal.close()
+        }
+    }
+
+    override fun commitStaged(staged: StagedHeaderChange) {
+        synchronized(lock) {
+            val change = asStaged(staged)
+            check(!change.committed) { "Already committed" }
+            require(change.vault.vaultId == current.vaultId) { "Replacement belongs to a different vault" }
+            val old = current
+            current = change.vault
+            change.committed = true
+            old.close()
+        }
+    }
+
+    /** A per-device convenience-unlock secret for the held key (see [OpenVault.exportLocalUnlockSecret]). */
+    fun exportLocalUnlockSecret(): ByteArray = synchronized(lock) { current.exportLocalUnlockSecret() }
 
     override fun fingerprint(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
@@ -70,56 +162,10 @@ class OpenVaultCodecHooks(vault: OpenVault) : VaultCodecHooks, AutoCloseable {
         return b.joinToString("") { "%02x".format(it) }
     }
 
-    /** A copy of the vault as the hooks currently hold it (with its newest header); the caller closes it. */
-    fun currentVault(): OpenVault = synchronized(lock) { current.withContent(current.content) }
-
-    /**
-     * Adopts [newVault] (the result of a local slot change or rotation) as the vault to upload. When its key
-     * epoch is higher the previous key is retired, not discarded. The caller keeps ownership of [newVault].
-     */
-    fun replaceVault(newVault: OpenVault) {
-        synchronized(lock) {
-            require(newVault.vaultId == current.vaultId) { "Replacement belongs to a different vault" }
-            require(newVault.keyEpoch >= current.keyEpoch) { "Replacement has an older key epoch" }
-            val copy = newVault.withContent(newVault.content)
-            val old = current
-            current = copy
-            if (copy.keyEpoch > old.keyEpoch) {
-                retired.add(old)
-                while (retired.size > MAX_RETIRED) retired.removeAt(0).close()
-            } else {
-                old.close()
-            }
-        }
-    }
-
     override fun close() {
-        synchronized(lock) {
-            current.close()
-            dropRetired()
-        }
-    }
-
-    private fun dropRetired() {
-        retired.forEach { it.close() }
-        retired.clear()
-    }
-
-    private fun adoptRemoteHeader(replacing: ByteArray) {
-        val info = VaultCodec.inspect(replacing)
-        if (info.vaultId != current.vaultId || info.keyEpoch != current.keyEpoch) return
-        if (info.headerRevision < current.headerRevision) return
-        val adopted = VaultCodec.openWithDataKey(replacing, current)
-        val old = current
-        current = adopted.withContent(old.content)
-        adopted.close()
-        old.close()
-    }
-
-    companion object {
-        const val MAX_RETIRED = 2
+        synchronized(lock) { current.close() }
     }
 }
 
-/** Wall-clock milliseconds, for [SyncEngine]'s `clock` parameter. */
+/** Wall-clock milliseconds, for `VaultSession`'s and [SyncEngine]'s `clock` parameters. */
 fun systemClockMillis(): Long = System.currentTimeMillis()

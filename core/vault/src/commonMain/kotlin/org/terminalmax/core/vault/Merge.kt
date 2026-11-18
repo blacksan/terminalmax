@@ -73,18 +73,27 @@ private fun sameRecords(a: List<VaultRecord>, b: List<VaultRecord>): Boolean =
  *
  * Per record id the result is the **maximum** under the total order (revision, deviceId, canonical JSON), i.e. a
  * pure join: commutative, associative and idempotent, and wall-clock time is never used. The base never selects a
- * lower version; it is only used to classify what happened:
- *  - the lower version is the base version (an ordinary fast-forward): nothing is reported;
- *  - the lower version is older than the base version: a [Regression] (a stale or replayed input), even when the
- *    other side changed the record meanwhile; the stale version is not kept in history;
- *  - both sides changed the record (or there is no base and both carry the same revision): a [Conflict], and the
- *    loser is kept in `history`;
- *  - the lower version is not the base version although that side did not change the record: a [Regression], the
- *    sign of a stale or replayed input. It is healed (the higher version wins) and never applied;
- *  - one id with two record types is always reported as a [Conflict] and the loser is kept in `history`.
+ * lower version; it only classifies what happened, and **a version this device cannot prove it has seen is never
+ * dropped silently**. For an id present on both sides with different versions, the lower one (the "loser") is:
+ *  - the base version itself: an ordinary fast-forward, nothing is reported;
+ *  - a version that either input already keeps in its `history` (it lost a conflict before and was reported then):
+ *    nothing is reported again, so merging a merge result is quiet; if it is also in the base's history it is a
+ *    [Regression] (a replay of something this device saw);
+ *  - a version this device has provably seen before (it is in the base's `history`): a [Regression], a true replay
+ *    of an old version. It is not kept in history again;
+ *  - anything else: a [Conflict], and the loser is kept in `history`. This covers both sides editing the record,
+ *    **two different devices that wrote the same revision** (concurrent by the Lamport rule), a loser that is below
+ *    the base revision but unseen (a genuine edit from a device that was behind), and one id with two record types.
+ *
+ * A version that is lower than the base but not provably an ancestor is a conflict rather than a regression
+ * because it is indistinguishable from a real concurrent edit; reporting a conflict costs the user a look at the
+ * history, calling it a replay would lose the edit. A record that one side lacks although the base had it is a
+ * [Regression] of that side (nothing is ever removed from a vault except by tombstones, which are records).
  *
  * Secrets are scrubbed from history: when the merged record is a tombstone, every history entry of that id with a
  * revision up to the tombstone's is dropped. History is capped at [VaultContent.MAX_HISTORY] entries and about 1 MiB.
+ * History is a union with a cap and pruning, so it converges but is not associative (see the property tests); the
+ * join property is claimed for the record set only.
  *
  * [localDeviceId] is reserved for attribution and does not influence the result. All inputs are validated.
  *
@@ -107,6 +116,15 @@ fun mergeVaults(base: VaultContent?, local: VaultContent, remote: VaultContent, 
     remote.validate()
 
     val baseById = base?.records?.associateBy { it.id } ?: emptyMap()
+    // Versions this device can prove it has seen: the base versions and everything the base kept in history.
+    val seen: Set<VaultRecord> = HashSet<VaultRecord>().also { set ->
+        base?.records?.let(set::addAll)
+        base?.history?.let(set::addAll)
+    }
+    val preserved: Set<VaultRecord> = HashSet<VaultRecord>().also { set ->
+        set.addAll(local.history)
+        set.addAll(remote.history)
+    }
     val localById = local.records.associateBy { it.id }
     val remoteById = remote.records.associateBy { it.id }
     val ids = (localById.keys + remoteById.keys).toSet().sorted()
@@ -134,28 +152,34 @@ fun mergeVaults(base: VaultContent?, local: VaultContent, remote: VaultContent, 
                 val winner = if (versionComparator.compare(l, r) >= 0) l else r
                 val loser = if (winner === l) r else l
                 mergedRecords += winner
-                val loserIsBase = b != null && loser == b
-                // A loser that is older than the base is a stale or replayed version, whether or not its side
-                // "changed" the record: it is reported as a regression and not kept (it was history long ago).
-                val loserBelowBase = b != null && !loserIsBase && versionComparator.compare(loser, b) < 0
-                if (!loserIsBase && !loserBelowBase) losers += loser
-                val bothChanged = b == null || (l != b && r != b)
+                val loserSide = if (loser === r) MergeSide.Remote else MergeSide.Local
                 val typeClash = l.wireTypeName != r.wireTypeName
+                // Two different devices at the same revision are concurrent by the Lamport rule.
+                val concurrent = l.revision == r.revision && l.deviceId != r.deviceId
+                val loserIsBase = b != null && loser == b
+                val loserSeen = loser in seen
+                // A loser that either side already keeps in its history was surfaced as a conflict when it lost;
+                // merging that result again must stay quiet (this is what makes the merge idempotent).
+                val alreadyPreserved = loser in preserved
                 when {
-                    typeClash -> conflicts += Conflict(id, winner, loser)
-                    loserBelowBase -> regressions += Regression(
-                        id,
-                        kept = winner,
-                        ignored = loser,
-                        ignoredSide = if (loser === r) MergeSide.Remote else MergeSide.Local,
-                    )
-                    bothChanged && (base != null || l.revision == r.revision) -> conflicts += Conflict(id, winner, loser)
-                    !bothChanged && !loserIsBase -> regressions += Regression(
-                        id,
-                        kept = winner,
-                        ignored = loser,
-                        ignoredSide = if (loser === r) MergeSide.Remote else MergeSide.Local,
-                    )
+                    typeClash -> {
+                        conflicts += Conflict(id, winner, loser)
+                        losers += loser
+                    }
+                    alreadyPreserved ->
+                        if (loserSeen && !loserIsBase) {
+                            regressions += Regression(id, kept = winner, ignored = loser, ignoredSide = loserSide)
+                        }
+                    concurrent -> {
+                        conflicts += Conflict(id, winner, loser)
+                        losers += loser
+                    }
+                    loserIsBase -> Unit // fast-forward
+                    loserSeen -> regressions += Regression(id, kept = winner, ignored = loser, ignoredSide = loserSide)
+                    else -> {
+                        conflicts += Conflict(id, winner, loser)
+                        losers += loser
+                    }
                 }
             }
         }

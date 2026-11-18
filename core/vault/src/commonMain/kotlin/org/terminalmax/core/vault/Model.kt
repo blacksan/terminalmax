@@ -26,6 +26,19 @@ const val SUPPORTED_SCHEMA_VERSION: Int = 2
 /** Largest revision number (content and record) that is accepted: 2^53 - 1, so it survives a JSON double. */
 const val MAX_REVISION: Long = (1L shl 53) - 1
 
+/**
+ * Largest increase of the content revision that sync accepts from one remote file compared with the highest revision
+ * this device has already seen (2^20). An honest device adds one per edit and one per merge, so a larger jump is a
+ * sign of a buggy or hostile writer trying to push the vault to [MAX_REVISION], where it could not be edited again.
+ */
+const val MAX_REVISION_JUMP: Long = 1L shl 20
+
+/**
+ * Revisions above `MAX_REVISION - REVISION_HEADROOM` are never accepted from a remote file, whatever the floor is
+ * (a fresh device has no floor to compare with). 2^32 leaves room for 4 billion further edits.
+ */
+const val REVISION_HEADROOM: Long = 1L shl 32
+
 /** The next revision after [current], failing instead of overflowing. */
 internal fun nextRevision(current: Long): Long {
     if (current < 0L || current >= MAX_REVISION) {
@@ -141,8 +154,10 @@ data class VaultContent(
     /**
      * Checks the structural rules that every content must satisfy, whether it was decoded from a file or built
      * locally: revisions in `[0, 2^53 - 1]` (records from 1), unique non-empty ids of at most [MAX_ID_CHARS]
-     * characters, at most [MAX_RECORDS] records and [MAX_HISTORY] history entries, bounded payload size, and no id
-     * that is used with two different record types.
+     * characters, at most [MAX_RECORDS] records and [MAX_HISTORY] history entries, bounded payload size, no id
+     * that is used with two different record types, and no record (or history entry) whose revision is above the
+     * content revision (honest writers always satisfy it; it stops one record from carrying the vault to the
+     * revision limit on its own).
      *
      * @throws VaultException.InvalidContent on the first violation (the message never contains record data)
      */
@@ -171,6 +186,7 @@ data class VaultContent(
             throw VaultException.InvalidContent("device id length")
         }
         if (r.revision !in 1L..MAX_REVISION) throw VaultException.InvalidContent("record revision out of range")
+        if (r.revision > revision) throw VaultException.InvalidContent("record revision above the content revision")
         if (recordSize(r) > MAX_PAYLOAD_CHARS) throw VaultException.InvalidContent("record too large")
     }
 

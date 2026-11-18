@@ -4,6 +4,7 @@ package org.terminalmax.core.sync
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.InetAddress
+import java.net.Proxy
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.time.ZonedDateTime
@@ -86,7 +87,10 @@ class WebDavStore(
         authorization = Credentials.basic(username, String(password), StandardCharsets.UTF_8)
         serverKey = "$collection|$username"
         val systemDns = httpClient.dns
-        client = httpClient.newBuilder()
+        val builder = httpClient.newBuilder()
+        // A loopback server is never reached through the system proxy (it could receive the Basic credentials).
+        if (isLoopbackHost(parsed.host)) builder.proxy(Proxy.NO_PROXY)
+        client = builder
             .followRedirects(false)
             .followSslRedirects(false)
             .dns(object : Dns {
@@ -189,6 +193,10 @@ class WebDavStore(
                 if (deleted >= MAX_SWEPT_FILES) break
                 val name = href.trimEnd('/').substringAfterLast('/')
                 if (!PROBE_NAME_PATTERN.matches(name)) continue
+                // Names start with the creation time (unix seconds, 8 hex digits): another device's probe that is
+                // still in flight must not be deleted, only leftovers older than an hour.
+                val createdAtSeconds = name.substring(PROBE_PREFIX.length, PROBE_PREFIX.length + 8).toLong(16)
+                if (System.currentTimeMillis() / 1000 - createdAtSeconds < PROBE_SWEEP_AGE_SECONDS) continue
                 deleted++
                 try {
                     send("DELETE", collection.newBuilder().addPathSegment(name).build())
@@ -205,6 +213,10 @@ class WebDavStore(
         }
     }
 
+    /** `terminalmax.probe-` + unix seconds (8 hex digits) + 8 random hex digits. */
+    private fun probeName(): String =
+        PROBE_PREFIX + (System.currentTimeMillis() / 1000).toString(16).padStart(8, '0').takeLast(8) + randomHex(4)
+
     /**
      * Measures what the server does with a scratch file, using the same ETag source the engine uses (the `ETag`
      * header of GET responses): a bogus `If-Match` must be rejected, the *correct* one must be accepted, create-only
@@ -214,7 +226,7 @@ class WebDavStore(
     private fun runProbe(): ServerCapabilities {
         ensureCollection()
         sweepStaleProbeFiles()
-        val scratch = collection.newBuilder().addPathSegment("terminalmax.probe-" + randomHex(8)).build()
+        val scratch = collection.newBuilder().addPathSegment(probeName()).build()
         try {
             val first = randomBytes(24)
             val created = putFile(scratch, first, null, false)
@@ -387,6 +399,8 @@ class WebDavStore(
         private const val PROPFIND_LIMIT = 64 * 1024
         private const val MAX_REDIRECTS = 3
         private const val MAX_SWEPT_FILES = 8
+        private const val PROBE_PREFIX = "terminalmax.probe-"
+        private const val PROBE_SWEEP_AGE_SECONDS = 3600L
         private val REDIRECT_CODES = setOf(301, 302, 303, 307, 308)
         private val NAME_PATTERN = Regex("(?!\\.{1,2}$)[A-Za-z0-9._-]{1,128}")
         private val PROBE_NAME_PATTERN = Regex("terminalmax\\.probe-[0-9a-f]{16}")

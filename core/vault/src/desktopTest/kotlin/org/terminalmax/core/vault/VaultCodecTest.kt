@@ -94,28 +94,6 @@ class VaultCodecTest {
         )
     }
 
-    @Test
-    fun x25519MatchesRfc7748() {
-        val alicePriv = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
-        val bobPriv = hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
-        val alicePub = hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
-        val bobPub = hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
-        val shared = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
-        assertEquals(shared, toHex(VaultCrypto.x25519(alicePriv, bobPub)))
-        assertEquals(shared, toHex(VaultCrypto.x25519(bobPriv, alicePub)))
-    }
-
-    @Test
-    fun generatedDeviceKeyPairsAgree() {
-        val a = VaultCodec.generateDeviceKeyPair()
-        val b = VaultCodec.generateDeviceKeyPair()
-        assertContentEquals(VaultCrypto.x25519(a.privateKey, b.publicKey), VaultCrypto.x25519(b.privateKey, a.publicKey))
-        val priv = a.privateKey.copyOf()
-        a.close()
-        assertTrue(a.privateKey.all { it == 0.toByte() })
-        assertFalse(priv.all { it == 0.toByte() })
-    }
-
     // ------------------------------------------------------------------ format basics
 
     @Test
@@ -155,8 +133,8 @@ class VaultCodecTest {
 
     @Test
     fun slotIdsAreOpaqueRandomIds() {
-        val v = VaultCodec.addDeviceSlot(sampleVault(), VaultCodec.generateDeviceKeyPair().publicKey)
-        assertTrue(v.slotIds.all { Regex("(pw|dev)-[0-9a-f]{16}").matches(it) }, v.slotIds.toString())
+        val v = VaultCodec.addPasswordSlot(sampleVault(), pw("second"), fast)
+        assertTrue(v.slotIds.all { Regex("pw-[0-9a-f]{16}").matches(it) }, v.slotIds.toString())
     }
 
     @Test
@@ -226,11 +204,11 @@ class VaultCodecTest {
 
     @Test
     fun everySampledBitFlipInHeaderAndCiphertextFailsAuthentication() {
-        val pair = VaultCodec.generateDeviceKeyPair()
-        val vault = VaultCodec.addDeviceSlot(sampleVault(), pair.publicKey, "dev1")
+        val vault = sampleVault()
         val bytes = VaultCodec.seal(vault)
-        // Sanity: unmodified file opens through the device slot.
-        VaultCodec.openWithDeviceKey(bytes, "dev1", pair.privateKey).close()
+        val secret = vault.exportLocalUnlockSecret()
+        // Sanity: the unmodified file opens through the (cheap) local unlock path.
+        VaultCodec.openWithLocalUnlockSecret(bytes, secret).close()
 
         val headerEnd = 10 + headerLength(bytes)
         val rnd = Random(12345)
@@ -244,7 +222,7 @@ class VaultCodecTest {
             val flipped = bytes.copyOf()
             flipped[pos] = (flipped[pos].toInt() xor (1 shl rnd.nextInt(8))).toByte()
             assertFailsWith<VaultException>("flip at byte $pos was accepted") {
-                VaultCodec.openWithDeviceKey(flipped, "dev1", pair.privateKey)
+                VaultCodec.openWithLocalUnlockSecret(flipped, secret)
             }
         }
         // A smaller sample through the password path (slow KDF).
@@ -325,6 +303,7 @@ class VaultCodecTest {
         // ... and cannot decrypt even when pretending to be at the new epoch.
         val oldKeyNewEpoch = OpenVault(changed.content, changed.header, original.dataKey().copyOf())
         assertFailsWith<VaultException.BadPasswordOrCorrupt> { VaultCodec.openWithDataKey(newFile, oldKeyNewEpoch) }
+        assertEquals(EpochLinkStatus.Verified, VaultCodec.verifyEpochLink(newFile, original))
         // The old file still opens with the old password (history cannot be rewritten) but is older by epoch.
         assertEquals(1L, VaultCodec.open(oldFile, pw()).keyEpoch)
         assertEquals(1L, VaultCodec.inspect(oldFile).keyEpoch)
@@ -338,138 +317,6 @@ class VaultCodecTest {
         val e = assertFailsWith<VaultException.KeyEpochMismatch> { VaultCodec.openWithDataKey(oldFile, v2) }
         assertEquals(1L, e.found)
         assertEquals(2L, e.expected)
-    }
-
-    @Test
-    fun changePasswordKeepsDeviceSlotsWorkingAndNeedsThePasswordOfOtherPasswordSlots() {
-        val device = VaultCodec.generateDeviceKeyPair()
-        var vault = VaultCodec.addDeviceSlot(sampleVault(), device.publicKey, "dev1")
-        vault = VaultCodec.addPasswordSlot(vault, pw("second"), fast)
-        val first = passwordSlotId(vault)
-        val second = vault.slots.last { it.type == SlotTypes.PASSWORD }.id
-        assertNotEquals(first, second)
-
-        // The other password slot cannot be re-wrapped without its password ...
-        assertFailsWith<IllegalArgumentException> { VaultCodec.changePassword(vault, pw("changed"), slotId = first) }
-        // ... and a wrong password for it is caught instead of producing a broken slot.
-        assertFailsWith<VaultException.BadPasswordOrCorrupt> {
-            VaultCodec.changePassword(vault, pw("changed"), slotId = first, otherPasswords = mapOf(second to pw("wrong")))
-        }
-        val changed = VaultCodec.changePassword(
-            vault, pw("changed"), slotId = first, otherPasswords = mapOf(second to pw("second")),
-        )
-        val bytes = VaultCodec.seal(changed)
-        VaultCodec.open(bytes, pw("changed")).close()
-        VaultCodec.open(bytes, pw("second")).close()
-        assertFailsWith<VaultException.BadPasswordOrCorrupt> { VaultCodec.open(bytes, pw()) }
-        assertEquals(changed.content, VaultCodec.openWithDeviceKey(bytes, "dev1", device.privateKey).content)
-    }
-
-    @Test
-    fun removingASlotRotatesTheDataKeyAndLocksOutTheRemovedDevice() {
-        val a = VaultCodec.generateDeviceKeyPair()
-        val b = VaultCodec.generateDeviceKeyPair()
-        var vault = VaultCodec.addDeviceSlot(sampleVault(), a.publicKey, "dev-a")
-        vault = VaultCodec.addDeviceSlot(vault, b.publicKey, "dev-b")
-        val before = VaultCodec.seal(vault)
-        VaultCodec.openWithDeviceKey(before, "dev-a", a.privateKey).close()
-
-        val passwords = mapOf(passwordSlotId(vault) to pw())
-        val removed = VaultCodec.removeSlot(vault, "dev-a", passwords)
-        assertEquals(vault.keyEpoch + 1, removed.keyEpoch)
-        assertEquals(vault.headerRevision + 1, removed.headerRevision)
-        assertFalse(vault.dataKey().contentEquals(removed.dataKey()))
-        val after = VaultCodec.seal(removed)
-
-        // The removed device is gone from the header and cannot use its old data key on the new file either.
-        assertFailsWith<VaultException.NoSuchSlot> { VaultCodec.openWithDeviceKey(after, "dev-a", a.privateKey) }
-        val oldDataKeyHolder = VaultCodec.openWithDeviceKey(before, "dev-a", a.privateKey)
-        assertFailsWith<VaultException.KeyEpochMismatch> { VaultCodec.openWithDataKey(after, oldDataKeyHolder) }
-        // The remaining device and the password still work, with the new key.
-        assertEquals(removed.content, VaultCodec.openWithDeviceKey(after, "dev-b", b.privateKey).content)
-        VaultCodec.open(after, pw()).close()
-        assertEquals(2L, VaultCodec.open(after, pw()).keyEpoch)
-    }
-
-    @Test
-    fun removingASlotChecksTheSuppliedPasswordsAndKeepsAPasswordSlot() {
-        val device = VaultCodec.generateDeviceKeyPair()
-        val vault = VaultCodec.addDeviceSlot(sampleVault(), device.publicKey, "dev1")
-        val pwId = passwordSlotId(vault)
-        assertFailsWith<VaultException.NoSuchSlot> { VaultCodec.removeSlot(vault, "missing") }
-        assertFailsWith<IllegalArgumentException> { VaultCodec.removeSlot(vault, "dev1") } // password missing
-        assertFailsWith<VaultException.BadPasswordOrCorrupt> {
-            VaultCodec.removeSlot(vault, "dev1", mapOf(pwId to pw("wrong")))
-        }
-        // The last password slot cannot be removed.
-        assertFailsWith<IllegalArgumentException> { VaultCodec.removeSlot(vault, pwId) }
-    }
-
-    // ------------------------------------------------------------------ X25519 device slots
-
-    @Test
-    fun deviceSlotRoundTripAndWrongKeyAndMissingSlot() {
-        val pair = VaultCodec.generateDeviceKeyPair()
-        val vault = VaultCodec.addDeviceSlot(sampleVault(), pair.publicKey, "dev1")
-        assertEquals(2L, vault.headerRevision)
-        assertEquals(1L, vault.keyEpoch) // adding a slot never replaces the data key
-        val bytes = VaultCodec.seal(vault)
-        assertEquals(vault.content, VaultCodec.openWithDeviceKey(bytes, "dev1", pair.privateKey).content)
-        assertFailsWith<VaultException.BadPasswordOrCorrupt> {
-            VaultCodec.openWithDeviceKey(bytes, "dev1", VaultCodec.generateDeviceKeyPair().privateKey)
-        }
-        assertFailsWith<VaultException.NoSuchSlot> { VaultCodec.openWithDeviceKey(bytes, "nope", pair.privateKey) }
-        assertFailsWith<VaultException.NoSuchSlot> {
-            VaultCodec.openWithDeviceKey(bytes, passwordSlotId(vault), pair.privateKey)
-        }
-        assertFailsWith<IllegalArgumentException> { VaultCodec.addDeviceSlot(vault, ByteArray(5)) }
-        assertFailsWith<IllegalArgumentException> { VaultCodec.addDeviceSlot(vault, pair.publicKey, "dev1") }
-        assertFailsWith<IllegalArgumentException> { VaultCodec.addDeviceSlot(vault, ByteArray(32)) } // low-order point
-    }
-
-    @Test
-    fun anotherDeviceCanReWrapTheVaultForEveryoneWithoutTheirPrivateKeys() {
-        val a = VaultCodec.generateDeviceKeyPair()
-        val b = VaultCodec.generateDeviceKeyPair()
-        val c = VaultCodec.generateDeviceKeyPair()
-        var v = VaultCodec.addDeviceSlot(sampleVault(), a.publicKey, "dev-a")
-        v = VaultCodec.addDeviceSlot(v, b.publicKey, "dev-b")
-        v = VaultCodec.addDeviceSlot(v, c.publicKey, "dev-c")
-        val shared = VaultCodec.seal(v)
-
-        // Device B (which only has its own private key) opens the vault, then retires device A.
-        val onB = VaultCodec.openWithDeviceKey(shared, "dev-b", b.privateKey)
-        val rotated = VaultCodec.removeSlot(onB, "dev-a", mapOf(passwordSlotId(onB) to pw()))
-        val file = VaultCodec.seal(rotated)
-
-        // Device C can open the new file with nothing but its own private key.
-        val onC = VaultCodec.openWithDeviceKey(file, "dev-c", c.privateKey)
-        assertEquals(2L, onC.keyEpoch)
-        assertEquals(onB.content, onC.content)
-        assertFailsWith<VaultException.NoSuchSlot> { VaultCodec.openWithDeviceKey(file, "dev-a", a.privateKey) }
-    }
-
-    @Test
-    fun aDeviceSlotCannotBeRelabelledOrMovedBetweenVaults() {
-        val pair = VaultCodec.generateDeviceKeyPair()
-        val bytes = VaultCodec.seal(VaultCodec.addDeviceSlot(sampleVault(), pair.publicKey, "dev1"))
-        val renamed = withHeader(bytes) { it.replace("\"id\":\"dev1\"", "\"id\":\"dev2\"") }
-        assertFailsWith<VaultException> { VaultCodec.openWithDeviceKey(renamed, "dev2", pair.privateKey) }
-        val retyped = withHeader(bytes) { it.replace("device-x25519", "password") }
-        assertFailsWith<VaultException> { VaultCodec.open(retyped, pw()) }
-    }
-
-    @Test
-    fun openWithDataKeyReadsAFileWithDifferentSlots() {
-        val v = sampleVault()
-        val device = VaultCodec.generateDeviceKeyPair()
-        val bytes = VaultCodec.seal(VaultCodec.addDeviceSlot(v, device.publicKey))
-        val reopened = VaultCodec.openWithDataKey(bytes, v)
-        assertEquals(v.content, reopened.content)
-        assertEquals(2, reopened.slots.size)
-        assertEquals(2L, reopened.headerRevision)
-        val foreign = sampleVault()
-        assertFailsWith<VaultException.DifferentVault> { VaultCodec.openWithDataKey(bytes, foreign) }
     }
 
     // ------------------------------------------------------------------ KDF limits
@@ -541,7 +388,7 @@ class VaultCodecTest {
         val bytes = VaultCodec.seal(sampleVault())
         val derivations = AtomicInteger()
         VaultCrypto.kdfObserver = { derivations.incrementAndGet() }
-        val aboveCeiling = withHeader(bytes) { it.replace("\"memoryKiB\":8192", "\"memoryKiB\":${256 * 1024 + 1}") }
+        val aboveCeiling = withHeader(bytes) { it.replace("\"memoryKiB\":8192", "\"memoryKiB\":${128 * 1024 + 1}") }
         assertFailsWith<VaultException.KdfCostTooHigh> { VaultCodec.open(aboveCeiling, pw()) }
         // A lower ceiling chosen by the caller (a small device) applies as well.
         assertFailsWith<VaultException.KdfCostTooHigh> { VaultCodec.open(bytes, pw(), memoryCeilingKiB = 8 * 1024 - 1) }
@@ -676,12 +523,11 @@ class VaultCodecTest {
     @Test
     fun truncatedGarbageAndOversizedInputsFailCleanly() {
         val good = VaultCodec.seal(sampleVault())
-        val pair = VaultCodec.generateDeviceKeyPair()
         assertFailsWith<VaultException> { VaultCodec.open(ByteArray(0), pw()) }
         assertFailsWith<VaultException> { VaultCodec.open(ByteArray(3), pw()) }
         assertFailsWith<VaultException> { VaultCodec.open("TMXV".toByteArray(), pw()) }
         assertFailsWith<VaultException> { VaultCodec.open(Random(1).nextBytes(5000), pw()) }
-        assertFailsWith<VaultException> { VaultCodec.openWithDeviceKey(Random(2).nextBytes(5000), "x", pair.privateKey) }
+        assertFailsWith<VaultException> { VaultCodec.openWithLocalUnlockSecret(Random(2).nextBytes(5000), Random(3).nextBytes(80)) }
 
         // Every truncation length (coarse steps plus the last 40 bytes) is rejected.
         val lengths = (0 until good.size step 37).toList() + (good.size - 40 until good.size).toList()

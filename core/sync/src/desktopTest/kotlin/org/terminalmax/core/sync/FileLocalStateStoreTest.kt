@@ -34,6 +34,7 @@ class FileLocalStateStoreTest {
         vaults = mapOf(
             "vault-1" to VaultSyncState(
                 baseFile = byteArrayOf(0, 1, 2, -1, -128, 127),
+                localFile = byteArrayOf(9, 8, 7, -2),
                 highestRevision = revision,
                 highestKeyEpoch = 2,
                 highestHeaderRevision = 3,
@@ -42,7 +43,6 @@ class FileLocalStateStoreTest {
         ),
         servers = mapOf(
             "http://dav.example/dav/|user" to ServerSyncState(
-                lastEtag = "\"etag\"",
                 capabilities = ServerCapabilities(
                     honoursIfMatch = true,
                     acceptsMatchingIfMatch = true,
@@ -55,6 +55,7 @@ class FileLocalStateStoreTest {
                 probedAtEpochMs = 123_456L,
             ),
         ),
+        deviceId = "dev-0123",
     )
 
     @Test

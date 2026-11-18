@@ -4,24 +4,47 @@ WebDAV synchronisation of the encrypted vault file produced by `:core:vault` (fo
 
 * `commonMain`: `RemoteStore` (single vault file plus a lock file), `ServerCapabilities`, `DeleteResult`,
   `SyncEngine`, `SyncOutcome` / `SyncResult` / `SyncWarning` / `SyncOptions` / `FailureReason`, `LocalStateStore`
-  with `VaultSyncState` / `ServerSyncState` and an in-memory implementation (tests), `VaultCodecHooks`
-  (the engine's view of encryption), `isStrongEtag` / `usableEtag`.
-* `jvmCommonMain` (Android + desktop): `WebDavStore` (OkHttp 5), `PropfindParser`, `OpenVaultCodecHooks`,
-  `FileLocalStateStore` (the persistent state store; a `java.io.File` directory is passed by the app).
+  with `LocalSyncState` / `VaultSyncState` / `ServerSyncState`, `VaultCodecHooks` (the engine's view of encryption,
+  including `StagedHeaderChange`), `isStrongEtag` / `usableEtag`. The in-memory state store is `internal` (tests).
+* `jvmCommonMain` (Android + desktop): **`VaultSession`** (the facade apps use), `WebDavStore` (OkHttp 5),
+  `PropfindParser`, `FileLocalStateStore`, and `OpenVaultCodecHooks` (internal; it holds the data key).
+
+## Use `VaultSession`
+
+`VaultSession` is the one thing an app should hold. It owns the local vault file, the sync state and the data key,
+and runs `edit`, `sync` and `changePassword` under one mutex, so an edit can never be overwritten by a sync that is
+already running and a sync always starts from the latest edit.
 
 ```kotlin
-val store = WebDavStore("https://dav.example.com/remote.php/dav/files/me/terminalmax/", user, password)
-val hooks = OpenVaultCodecHooks(openVault)                       // keeps its own copy of the data key
-val state = FileLocalStateStore(File(context.filesDir, "sync")) // survives restarts: required for rollback protection
-val engine = SyncEngine(store, hooks, state, deviceId, clock = ::systemClockMillis)
-val result = engine.sync(localContent)        // SyncResult(outcome, content, warnings); never throws
-localContent = result.content
-result.warnings.forEach { /* show FirstUseTrust, StaleRemoteIgnored, ForkSuspected, ... */ }
+val dir = File(context.filesDir, "vault")                       // one directory per local vault
+val session = VaultSession.create(dir, password)                 // or VaultSession.open(dir, password)
+session.edit { it.upsertHost(HostPayload("router", "192.0.2.1", 22, "admin")) }   // committed to disk, then published
+val store = WebDavStore("https://dav.example.com/remote.php/dav/files/me/terminalmax/", user, davPassword)
+val result = session.sync(store)                                 // SyncResult(outcome, content, warnings); never throws
+result.warnings.forEach { /* show FirstUseTrust, StaleRemoteIgnored, ForkSuspected, KeyEpochChainUnverified, ... */ }
+session.content                                                  // StateFlow<VaultContent>
+
+session.changePassword(old, new, remote = store)                 // one sync transaction, see below
+
+val unlock = session.exportLocalUnlockSecret()                   // the data key itself: platform secure storage only
+VaultSession.openWithLocalUnlockSecret(dir, unlock)              // KeyEpochMismatch after any password change
+session.close()                                                  // zeroes the key
 ```
 
-After a local slot change or rotation (`VaultCodec.changePassword`, `addDeviceSlot`, `removeSlot`) hand the new
-`OpenVault` to `hooks.replaceVault(...)`; the next `sync` publishes the new header even when the content did not
-change. `sync` returns `SyncOutcome.Failed(reason, detail)` for every failure and throws only `CancellationException`.
+**Persistence is one file.** `FileLocalStateStore(dir)` keeps `terminalmax-sync-state.bin` (`"TMXS"`, version,
+SHA-256, JSON). It holds, per vault id: the sealed **local vault file** (ciphertext), the **base** file used for
+merging (ciphertext), the highest content revision, key epoch and header revision, and up to 64 file digests; per
+server: the last ETag and the probe result with its time; and the device id. Everything that must stay consistent
+(the local file and the floors) is written in a single replace: temp file, `fsync`, atomic rename over the state file,
+directory `fsync`, so a crash leaves the old state or the new one and never a vault file that is out of step with its
+floors. A damaged or unreadable state file is **never** replaced by an empty one: `sync` fails with
+`LocalStateUnavailable` and `FileLocalStateStore.reset()` is the explicit way out (it switches rollback protection off
+for a fresh start). `exclusive` serialises users of the same directory with a mutex plus an OS file lock on
+`terminalmax-sync-state.bin.lock`; a second process is kept out during each operation but its edits are not merged
+into a running session.
+
+The lower-level `SyncEngine` and `OpenVaultCodecHooks` remain public/internal building blocks and are covered by their
+own tests, but nothing else should hold a key or a state file next to a session.
 
 ## Algorithm
 
@@ -36,10 +59,17 @@ change. `sync` returns `SyncOutcome.Failed(reason, detail)` for every failure an
    the content revision are compared with the **floors** this device remembers (highest ever seen, also taken from
    the stored base). Lower key epoch or header revision: `RollbackDetected`, never overridable. Lower content
    revision: `RollbackDetected`, overridable with `SyncOptions.allowRollback`; the merge below still never lets an
-   older record win. A newer key epoch: `ReopenRequired` (the vault key was rotated elsewhere).
+   older record win. A content revision more than `MAX_REVISION_JUMP` (2^20) above the floor, or within
+   `REVISION_HEADROOM` (2^32) of the maximum revision, is `SuspiciousRevisionJump` and is not merged (a hostile
+   writer could otherwise make the vault un-editable). A newer key epoch: `ReopenRequired` (the vault key was rotated
+   elsewhere): call `sync` again with the master password (`reopenPassword`). The new file is then checked against
+   this device's old key with the epoch chain; a link that does not verify is reported as
+   `SyncWarning.KeyEpochChainUnverified`, which tells the user that a device this one cannot verify re-keyed the
+   vault (only someone who knows the password could have, since the new epoch opened with it).
 3. **Merge** local, remote and the stored base. The merge keeps the highest version of every record. A remote that
-   offers older versions than this device already has is reported as `SyncWarning.StaleRemoteIgnored`, the newer
-   versions are uploaded again. A different file than one seen before at the same revision is
+   offers older versions that this device provably saw before (they are in the base or its history) is reported as
+   `SyncWarning.StaleRemoteIgnored` and the newer versions are uploaded again; an older version it cannot prove it
+   saw (including two devices that wrote the same revision) is a conflict, not a replay, and is kept in history. A different file than one seen before at the same revision is
    `SyncWarning.ForkSuspected`. The very first sync of an existing remote is `SyncWarning.FirstUseTrust`.
 4. **Upload** when the merge differs from the remote, or when this device holds a newer key epoch or slot set. When
    the server honours preconditions (`supportsConditionalWrites`) the PUT carries `If-Match: <strong etag>`.
@@ -53,16 +83,23 @@ change. `sync` returns `SyncOutcome.Failed(reason, detail)` for every failure an
    is uploaded. With `SyncOptions.recreateRemote` the device publishes its copy again, at a revision above the floor,
    with a `RemoteRecreated` warning.
 
-### Persistent state
+### Password change as one transaction
 
-`FileLocalStateStore(directory)` keeps one file, `terminalmax-sync-state.bin` (`"TMXS"`, version, SHA-256, JSON). It
-holds, per vault id: the base file as ciphertext (no secret), the highest content revision, key epoch and header
-revision, and up to 64 file digests; per server: the last ETag and the probe result with its time. Saves write a
-temp file, `fsync` it, rename it atomically over the state file and sync the directory, so a crash leaves the old
-state or the new one. A damaged or unreadable state file is **never** replaced by an empty one: `sync` fails with
-`LocalStateUnavailable` and `FileLocalStateStore.reset()` is the explicit way out (it switches rollback protection
-off for a fresh start). `exclusive` serialises engines of the same directory with a mutex plus an OS file lock.
-`InMemoryLocalStateStore` loses everything on restart and is for tests only.
+`VaultSession.changePassword(old, new, remote)` replaces the data key, which is why it is a sync transaction and not a
+local edit:
+
+1. verify `old`, then run a normal sync, so everything written at the old key epoch is imported (and reported);
+2. derive the new key and header in memory (a *staged* change); nothing local changes yet;
+3. upload the re-keyed file only if the remote file is still exactly what step 1 left (`If-Match`, or the lock lease
+   on servers without preconditions). Another device having changed the vault meanwhile gives
+   `RemoteChangedDuringRotation` or `HeaderChangedRemotely`; nothing was changed, repeat the call;
+4. read the upload back; **only then** commit the new key, the local file and the floors in one state write.
+
+A crash or failure before step 4 leaves the old password and epoch untouched, and the remote at worst already holds
+the new epoch (which this device then adopts through `ReopenRequired` plus its password). Other devices follow with
+`ReopenRequired`. Revocation of a device takes effect once every remaining device has synced at the new epoch; until
+then a device still at the old epoch can write old-epoch files, and only devices that have seen the new epoch refuse
+them. It cannot recall what a device already read.
 
 ### Lock lease
 
@@ -89,7 +126,9 @@ after the fixes in this version.
   explicitly allow it, the merge keeps the newer record and reports a `StaleRemoteIgnored` warning, and the next
   upload puts the newer data back;
 * bring back a **removed key slot or an old password** by replaying an old header: the device has remembered the
-  highest key epoch and slot-set revision, refuses lower ones, and never uploads one;
+  highest key epoch and slot-set revision, refuses lower ones, and never uploads one. This holds for devices that have
+  already synced the vault and a persistent state store; a device that is behind on epochs is only protected once it
+  has seen the newer epoch (see *It can still*);
 * silently **delete the vault**: a missing remote file is reported as `RemoteMissing` and nothing is uploaded until
   you choose to re-create it; a re-created file is always above the revision already seen;
 * make `sync` crash or hang with hostile headers or XML: ETags that are not strong, quoted visible ASCII of at most
@@ -106,6 +145,10 @@ after the fixes in this version.
   with and accepts what it gets (trust on first use). It reports `FirstUseTrust` with the revision, so compare it
   with what another device shows. After the first sync the floors protect it. The floors live in the state store:
   without a persistent one (or after `reset()` or reinstalling) the protection starts again from nothing.
+* **Serve a device an older key epoch.** A device that last saw epoch *n* and is offered a file at *n* that predates a
+  password change has no way to know a change happened until it sees the newer epoch; the server can keep it on the
+  old epoch indefinitely, and such a device keeps writing old-epoch files. This is the same withholding attack as
+  below and is why revocation is only complete once every device has synced the new epoch.
 * **Withhold updates or refuse service.** It can hide new versions, fail every request, answer slowly, or delete the
   lock and vault files. That cannot be told apart from an outage and is not prevented, only reported as an error.
   A device then keeps working locally and syncs when the server behaves.
@@ -128,8 +171,12 @@ after the fixes in this version.
 
 * Background scheduling and conflict-resolution UI.
 * A user interface for the warnings and for choosing `allowRollback` / `recreateRemote` / `reset()`.
-* Secure storage of the device key (Android Keystore / DPAPI / macOS Keychain) used for device slots.
+* Secure storage of the local unlock secret (Android Keystore / DPAPI / macOS Keychain): the session only produces
+  and consumes the raw bytes.
 * Tombstone garbage collection.
 * Cancelling an in-flight HTTP call promptly (blocking OkHttp calls run on `Dispatchers.IO` and end by timeout), and
   streaming of large responses (a plain 8 MiB cap is applied).
 * Merging concurrent key rotations by two devices (one of them has to re-open the vault).
+* The residual lock race on servers that ignore preconditions is documented, not removed (see below).
+* `VaultSession.changePassword` supports a vault with a single password slot; managing the second slot is done with
+  `VaultCodec` directly.

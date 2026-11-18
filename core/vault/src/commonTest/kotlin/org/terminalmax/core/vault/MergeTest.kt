@@ -75,7 +75,7 @@ class MergeTest {
     @Test
     fun bothChangedHigherRevisionWinsLoserGoesToHistory() {
         val base = content(1, record("a", 1, "A"))
-        val local = content(2, record("a", 3, "A"))
+        val local = content(3, record("a", 3, "A"))
         val remote = content(2, record("a", 2, "B"))
         val result = mergeVaults(base, local, remote, "A")
         assertEquals(3L, byId(result.merged)["a"]!!.revision)
@@ -99,14 +99,14 @@ class MergeTest {
     @Test
     fun deleteVersusEditUsesTheSameOrdering() {
         val base = content(1, record("a", 1, "A"))
-        val deleteHigher = content(2, record("a", 3, "A", deleted = true))
+        val deleteHigher = content(3, record("a", 3, "A", deleted = true))
         val editLower = content(2, record("a", 2, "B"))
         val r1 = mergeVaults(base, deleteHigher, editLower, "A")
         assertTrue(byId(r1.merged)["a"]!!.deleted)
         assertEquals(1, r1.conflicts.size)
 
         val deleteLower = content(2, record("a", 2, "A", deleted = true))
-        val editHigher = content(2, record("a", 3, "B"))
+        val editHigher = content(3, record("a", 3, "B"))
         val r2 = mergeVaults(base, deleteLower, editHigher, "A")
         assertFalse(byId(r2.merged)["a"]!!.deleted)
         assertEquals(deleteLower.records[0], r2.merged.history.single())
@@ -122,13 +122,14 @@ class MergeTest {
     }
 
     @Test
-    fun withoutBaseLowerRevisionIsKeptInHistoryButNotReportedAsConflict() {
+    fun withoutBaseAnUnseenLowerVersionIsAConflictAndKeptInHistory() {
         val local = content(1, record("a", 1, "A"))
         val remote = content(2, record("a", 2, "B"))
         val result = mergeVaults(null, local, remote, "A")
         assertEquals(2L, byId(result.merged)["a"]!!.revision)
-        assertTrue(result.conflicts.isEmpty())
-        assertEquals(1, result.merged.history.size)
+        assertEquals(1, result.conflicts.size)
+        assertTrue(result.regressions.isEmpty())
+        assertEquals(listOf(local.records[0]), result.merged.history)
     }
 
     @Test
@@ -172,8 +173,8 @@ class MergeTest {
         val remoteHistory = (151..300).map { record("h$it", it.toLong(), "A") }
         val result = mergeVaults(
             null,
-            content(1, history = localHistory),
-            content(1, history = remoteHistory),
+            content(300, history = localHistory),
+            content(300, history = remoteHistory),
             "A",
         )
         assertEquals(VaultContent.MAX_HISTORY, result.merged.history.size)
@@ -289,33 +290,85 @@ class MergeTest {
     // ---- format v2: pure join, regressions, scrubbing, validation ----
 
     @Test
-    fun staleRemoteNeverRevertsARecordAndIsReportedAsARegression() {
+    fun staleRemoteNeverRevertsARecordAndTheUnprovableVersionIsKeptAsAConflict() {
         val base = content(4, record("x", 4, "A"))
         val local = base
         val remote = content(3, record("x", 3, "A"))
         val result = mergeVaults(base, local, remote, "A")
         assertEquals(4L, byId(result.merged)["x"]!!.revision)
         assertTrue(result.changedRemotely) // the healed content must be pushed back
-        val regression = result.regressions.single()
-        assertEquals("x", regression.recordId)
-        assertEquals(MergeSide.Remote, regression.ignoredSide)
-        assertEquals(3L, regression.ignored!!.revision)
-        assertEquals(4L, regression.kept.revision)
-        assertTrue(result.conflicts.isEmpty())
+        // x@3 is below the base but this device cannot prove it is an ancestor: it is never dropped silently.
+        assertTrue(result.regressions.isEmpty())
+        val conflict = result.conflicts.single()
+        assertEquals(3L, conflict.loser.revision)
+        assertEquals(listOf(remote.records[0]), result.merged.history)
     }
 
     @Test
-    fun aVersionOlderThanTheBaseIsARegressionEvenWhenTheOtherSideEditedMeanwhile() {
-        val base = content(2, record("x", 2, "A"))
-        val local = content(3, record("x", 3, "B"))
-        val staleRemote = content(1, record("x", 1, "A"))
-        val result = mergeVaults(base, local, staleRemote, "B")
-        assertEquals(3L, byId(result.merged)["x"]!!.revision)
-        assertTrue(result.conflicts.isEmpty())
+    fun aReplayOfAVersionTheDeviceProvablySawIsARegressionAndNotKeptAgain() {
+        val old = record("x", 3, "A")
+        val base = content(4, record("x", 4, "A"), history = listOf(old))
+        val result = mergeVaults(base, base, content(3, old), "A")
+        assertEquals(4L, byId(result.merged)["x"]!!.revision)
         val regression = result.regressions.single()
         assertEquals(MergeSide.Remote, regression.ignoredSide)
-        assertEquals(1L, regression.ignored!!.revision)
-        assertTrue(result.merged.history.none { it.id == "x" })
+        assertEquals(old, regression.ignored)
+        assertTrue(result.conflicts.isEmpty())
+        assertEquals(base.history, result.merged.history)
+    }
+
+    // R-S1 case 1: A edited twice (base X@12), the server served the old file to B, B edited X@11 and pushed.
+    @Test
+    fun aGenuineEditBelowTheBaseRevisionIsAConflictNeverASilentRegression() {
+        val base = content(12, record("x", 12, "A"))
+        val remoteFromB = content(11, record("x", 11, "B"))
+        val onA = mergeVaults(base, base, remoteFromB, "A")
+        assertEquals("A", byId(onA.merged)["x"]!!.deviceId)
+        assertTrue(onA.regressions.isEmpty())
+        assertEquals(remoteFromB.records[0], onA.conflicts.single().loser)
+        assertEquals(listOf(remoteFromB.records[0]), onA.merged.history)
+        // B later pulls A's file: its own X@11 is the base, a plain fast-forward, and A's history carries X@11.
+        val onB = mergeVaults(remoteFromB, remoteFromB, onA.merged, "B")
+        assertEquals("A", byId(onB.merged)["x"]!!.deviceId)
+        assertTrue(onB.regressions.isEmpty())
+        assertEquals(listOf(remoteFromB.records[0]), onB.merged.history)
+    }
+
+    // R-S1 case 2: same revision from two devices is always concurrent, whichever side is the base.
+    @Test
+    fun equalRevisionsFromTwoDevicesAreAConflictEvenWhenOneIsTheBase() {
+        val base = content(11, record("x", 11, "A"))
+        val remote = content(11, record("x", 11, "B"))
+        val onA = mergeVaults(base, base, remote, "A")
+        assertEquals(1, onA.conflicts.size)
+        assertEquals("B", byId(onA.merged)["x"]!!.deviceId)
+        assertEquals(base.records, onA.merged.history)
+        val onB = mergeVaults(remote, remote, base, "B")
+        assertEquals(1, onB.conflicts.size)
+        assertEquals(byId(onA.merged), byId(onB.merged))
+        assertEquals(onA.merged.history, onB.merged.history)
+    }
+
+    // R-S1 case 3: a crash lost the local save; the next edit is made on stale content and ranks below the base.
+    @Test
+    fun anEditMadeOnStaleLocalContentIsKeptInHistory() {
+        val base = content(12, record("x", 12, "A"))
+        val staleEdit = content(11, record("x", 11, "A", value = "my new password"))
+        val result = mergeVaults(base, staleEdit, base, "A")
+        assertEquals(12L, byId(result.merged)["x"]!!.revision)
+        assertEquals(1, result.conflicts.size)
+        assertEquals(staleEdit.records, result.merged.history)
+        assertTrue(result.regressions.isEmpty())
+    }
+
+    @Test
+    fun theEditorsRevisionFloorKeepsAnEditAboveWhatWasAlreadySynced() {
+        val stale = content(10, record("x", 10, "A"))
+        val editor = VaultEditor(stale, "A", revisionFloor = 12L)
+        val edited = editor.upsert(RecordType.Snippet, "x", payload("new"))
+        assertEquals(13L, edited.revision)
+        assertEquals(13L, editor.content.revision)
+        editor.content.validate()
     }
 
     @Test
@@ -325,8 +378,8 @@ class MergeTest {
         val base = content(4, tombstone)
         val result = mergeVaults(base, content(4, tombstone), content(3, live), "A")
         assertTrue(byId(result.merged)["x"]!!.deleted)
-        assertEquals(MergeSide.Remote, result.regressions.single().ignoredSide)
-        // and the secret of the replayed version does not end up in history: the tombstone scrubs it
+        // The replay cannot be proven to be an ancestor, so it is reported, but the tombstone scrubs it from history.
+        assertEquals(1, result.conflicts.size)
         assertTrue(result.merged.history.none { it.id == "x" })
     }
 
@@ -343,13 +396,14 @@ class MergeTest {
     }
 
     @Test
-    fun aStaleLocalContentIsHealedFromTheBaseAndReportedOnTheLocalSide() {
+    fun aStaleLocalContentIsHealedFromTheBaseAndItsUnseenVersionIsKept() {
         // The crash case: the base (state) is ahead of the local content that the caller failed to persist.
         val base = content(4, record("x", 4, "A"))
         val staleLocal = content(3, record("x", 3, "A"))
         val result = mergeVaults(base, staleLocal, base, "A")
         assertEquals(4L, byId(result.merged)["x"]!!.revision)
-        assertEquals(MergeSide.Local, result.regressions.single().ignoredSide)
+        assertEquals(1, result.conflicts.size)
+        assertEquals(staleLocal.records, result.merged.history)
         assertTrue(result.changedLocally)
     }
 
@@ -364,19 +418,19 @@ class MergeTest {
 
     @Test
     fun allowRollbackStyleInputCannotEraseNewerRecords() {
-        // Everything the remote carries is older than local: the merge is a no-op for local, never a revert.
+        // Everything the remote carries is older than local: the record set never reverts.
         val local = content(10, record("a", 5, "A"), record("b", 6, "B"))
         val staleRemote = content(2, record("a", 1, "A"), record("b", 2, "B"))
         val result = mergeVaults(local, local, staleRemote, "A")
         assertEquals(byId(local), byId(result.merged))
-        assertEquals(2, result.regressions.size)
+        assertEquals(2, result.conflicts.size) // not provably ancestors: kept in history, not dropped silently
     }
 
     @Test
     fun aTombstoneThatWinsScrubsTheSecretsOfThatRecordFromHistory() {
         val secret = record("k", 2, "B", value = "TOP-SECRET")
-        val withHistory = content(2, record("k", 3, "A"), history = listOf(secret))
-        val deleted = content(3, record("k", 4, "A", deleted = true), history = listOf(secret))
+        val withHistory = content(3, record("k", 3, "A"), history = listOf(secret))
+        val deleted = content(4, record("k", 4, "A", deleted = true), history = listOf(secret))
         val result = mergeVaults(null, withHistory, deleted, "A")
         assertTrue(byId(result.merged)["k"]!!.deleted)
         assertTrue(result.merged.history.none { it.id == "k" }, "old versions of a deleted record must leave the history")
@@ -413,6 +467,7 @@ class MergeTest {
             content(1, record("", 1, "A")),
             content(1, record("a", -1, "A")),
             content(1, record("a", Long.MAX_VALUE, "A")),
+            content(1, record("a", 2, "A")), // a record above the content revision
             content(1, history = (1..201).map { record("h$it", it.toLong(), "A") }),
         )
         for (b in bad) {
@@ -438,6 +493,48 @@ class MergeTest {
             assertEquals(byId(m(m(a, b), c)), byId(m(a, m(b, c))), "seed $seed")
             assertEquals(byId(m(m(a, b), c)), byId(m(m(c, a), b)), "seed $seed")
         }
+    }
+
+    private fun randomContent(rnd: Random, device: String): VaultContent {
+        val editor = VaultEditor(VaultContent.empty(vaultId), device)
+        repeat(rnd.nextInt(0, 8)) {
+            val id = "r${rnd.nextInt(0, 5)}"
+            if (rnd.nextInt(4) == 0) editor.delete(id) else editor.upsert(RecordType.Snippet, id, payload("$device${rnd.nextInt(50)}"))
+        }
+        return editor.content
+    }
+
+    @Test
+    fun theRecordSetIsAJoinIdempotentCommutativeAndAssociativeForArbitraryInputsAndBases() {
+        for (seed in 5000 until 5300) {
+            val rnd = Random(seed)
+            val a = randomContent(rnd, "A")
+            val b = randomContent(rnd, "B")
+            val c = randomContent(rnd, "C")
+            val base = if (rnd.nextBoolean()) randomContent(rnd, "base") else null
+            fun m(x: VaultContent, y: VaultContent) = mergeVaults(base, x, y, "A").merged
+            assertEquals(byId(a).keys + byId(b).keys, byId(m(a, b)).keys, "seed $seed")
+            assertEquals(byId(m(a, a)), byId(a), "idempotent, seed $seed")
+            assertEquals(byId(m(a, b)), byId(m(b, a)), "commutative, seed $seed")
+            assertEquals(byId(m(m(a, b), c)), byId(m(a, m(b, c))), "associative, seed $seed")
+            // The result never depends on the base: it is the per-id maximum.
+            assertEquals(byId(m(a, b)), byId(mergeVaults(null, a, b, "A").merged), "base independent, seed $seed")
+        }
+    }
+
+    // R-N7: history is a capped union that scrubs under tombstones; it converges but is not associative.
+    @Test
+    fun historyIsNotAssociativeButTheRecordSetIs() {
+        val x3 = record("x", 3, "A")
+        val tomb5 = record("x", 5, "A", deleted = true)
+        val live6 = record("x", 6, "B")
+        val a = content(5, tomb5, history = listOf(x3))
+        val b = content(5, tomb5)
+        val c = content(6, live6)
+        fun m(p: VaultContent, q: VaultContent) = mergeVaults(null, p, q, "A").merged
+        assertEquals(byId(m(m(a, b), c)), byId(m(a, m(b, c))))
+        assertTrue(m(m(a, b), c).history.none { it.id == "x" && it.revision == 3L })
+        assertTrue(m(a, m(b, c)).history.any { it.id == "x" && it.revision == 3L })
     }
 
     // ---- three devices, stale servers, crashes: everything converges and no winning edit is lost ----

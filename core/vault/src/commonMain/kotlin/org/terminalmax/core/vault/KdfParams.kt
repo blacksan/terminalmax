@@ -29,10 +29,12 @@ data class KdfParams(val memoryKiB: Int, val iterations: Int, val parallelism: I
         const val MAX_PARALLELISM = 16
 
         /**
-         * Default ceiling on the memory a reader is willing to spend on one password slot (256 MiB). It is checked
-         * against the unauthenticated header before any key derivation; phones should not go above it.
+         * Default ceiling on the memory a reader is willing to spend on one password slot (128 MiB, twice the
+         * default of 64 MiB). It is checked against the unauthenticated header before any key derivation, so a
+         * foreign file cannot make a phone allocate more than this on its heap (the Argon2 implementation is pure
+         * JVM and allocates the whole matrix up front).
          */
-        const val PLATFORM_CEILING_KIB = 256 * 1024
+        const val PLATFORM_CEILING_KIB = 128 * 1024
 
         /** Largest sum of [cost] over all password slots of one file: four times the default cost (64 MiB, t=3). */
         const val MAX_TOTAL_COST: Long = 4L * 65_536L * 3L

@@ -36,8 +36,11 @@ import kotlinx.serialization.json.long
  * does not reset every time the OS kills the app.
  *
  * Layout: one state file, `<directory>/<fileName>`. It holds `"TMXS" | u8 version | SHA-256(payload) | payload`
- * where the payload is JSON. It contains no secrets (the base is ciphertext), but it should still live in the
- * app's private storage; whoever can rewrite it can lower the floors.
+ * where the payload is JSON: the floors, digests and probe results, the base file, and (when a `VaultSession` owns the
+ * directory) the sealed local vault file and the device id. **That single file is the manifest**: it is replaced
+ * atomically, so the local vault and the sync state cannot diverge after a crash. It contains no plaintext secrets
+ * (the vault files are ciphertext), but it should still live in the app's private storage; whoever can rewrite it can
+ * lower the floors or substitute an older local vault.
  *
  * Atomicity: [save] writes `<fileName>.tmp` completely, forces it to disk (`fsync`), then renames it over the
  * state file with an atomic move and forces the directory. A crash at any point leaves either the old state or the
@@ -105,13 +108,19 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
         }
     }
 
-    /** Deletes the stored state (an explicit user decision: it switches rollback protection off for a fresh start). */
+    /**
+     * Deletes the stored state (an explicit user decision: it switches rollback protection off for a fresh start).
+     * Takes the same per-path mutex and file lock as [exclusive], so it cannot race a running sync; call it outside
+     * [exclusive].
+     */
     suspend fun reset() {
-        withContext(Dispatchers.IO) {
-            stateFile.delete()
-            tempFile.delete()
+        exclusive {
+            withContext(Dispatchers.IO) {
+                stateFile.delete()
+                tempFile.delete()
+            }
+            cached = null
         }
-        cached = null
     }
 
     // ------------------------------------------------------------------ locking
@@ -173,12 +182,14 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
         for ((id, element) in root.getValue("vaults").jsonObject) {
             val o = element.jsonObject
             val base = o["base"]?.jsonPrimitive?.content?.let { Base64.Default.decode(it) }
+            val localFile = o["local"]?.jsonPrimitive?.content?.let { Base64.Default.decode(it) }
             val digests = LinkedHashMap<Long, String>()
             for ((revision, digest) in o.getValue("digests").jsonObject) {
                 digests[revision.toLong()] = digest.jsonPrimitive.content
             }
             val state = VaultSyncState(
                 baseFile = base,
+                localFile = localFile,
                 highestRevision = o.getValue("revision").jsonPrimitive.long,
                 highestKeyEpoch = o.getValue("keyEpoch").jsonPrimitive.long,
                 highestHeaderRevision = o.getValue("headerRevision").jsonPrimitive.long,
@@ -204,12 +215,11 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
                 )
             }
             servers[key] = ServerSyncState(
-                lastEtag = o["etag"]?.jsonPrimitive?.content,
                 capabilities = caps,
                 probedAtEpochMs = o["probedAt"]?.jsonPrimitive?.long ?: 0L,
             )
         }
-        return LocalSyncState(vaults, servers)
+        return LocalSyncState(vaults, servers, root["deviceId"]?.jsonPrimitive?.content)
     }
 
     // ------------------------------------------------------------------ writing
@@ -220,6 +230,8 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
             val o = LinkedHashMap<String, JsonElement>()
             val base = v.baseFile
             if (base != null) o["base"] = JsonPrimitive(Base64.Default.encode(base))
+            val localFile = v.localFile
+            if (localFile != null) o["local"] = JsonPrimitive(Base64.Default.encode(localFile))
             o["revision"] = JsonPrimitive(v.highestRevision)
             o["keyEpoch"] = JsonPrimitive(v.highestKeyEpoch)
             o["headerRevision"] = JsonPrimitive(v.highestHeaderRevision)
@@ -231,8 +243,6 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
         val servers = LinkedHashMap<String, JsonElement>()
         for ((key, s) in state.servers) {
             val o = LinkedHashMap<String, JsonElement>()
-            val etag = s.lastEtag
-            if (etag != null) o["etag"] = JsonPrimitive(etag)
             o["probedAt"] = JsonPrimitive(s.probedAtEpochMs)
             val c = s.capabilities
             if (c != null) {
@@ -250,8 +260,11 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
             }
             servers[key] = JsonObject(o)
         }
-        val root = JsonObject(mapOf("vaults" to JsonObject(vaults), "servers" to JsonObject(servers)))
-        return root.toString().encodeToByteArray()
+        val root = LinkedHashMap<String, JsonElement>()
+        root["vaults"] = JsonObject(vaults)
+        root["servers"] = JsonObject(servers)
+        state.deviceId?.let { root["deviceId"] = JsonPrimitive(it) }
+        return JsonObject(root).toString().encodeToByteArray()
     }
 
     private fun writeToDisk(state: LocalSyncState) {
