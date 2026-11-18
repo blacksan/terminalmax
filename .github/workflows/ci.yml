@@ -1,0 +1,368 @@
+# Third-party actions are pinned to full commit SHAs (the version is in the trailing comment);
+# Dependabot (.github/dependabot.yml) proposes bumps. The artifacts uploaded here are UNSIGNED
+# debug/CI builds of every branch push: treat them as untrusted and never release from this workflow.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.24.x"
+          cache: false
+      # go.sum is committed: download checks every module against it, verify re-hashes the module cache.
+      - name: go mod download && go mod verify
+        working-directory: native/wgbridge
+        run: go mod download && go mod verify
+      - name: Build libwgbridge.so (arm64-v8a, x86_64)
+        working-directory: native/wgbridge
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./build-android.sh
+      # The libraries are built here, never committed; Gradle packages src/main/jniLibs/<abi>/.
+      - name: Copy libwgbridge.so into the app
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a x86_64; do
+            mkdir -p "androidApp/src/main/jniLibs/$abi"
+            cp "native/wgbridge/out/android/$abi/libwgbridge.so" "androidApp/src/main/jniLibs/$abi/libwgbridge.so"
+          done
+          find androidApp/src/main/jniLibs -type f
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - name: Build debug APK and run tests
+        run: ./gradlew :androidApp:assembleDebug desktopTest --continue
+      # Unsigned is fine: this only makes R8 (and the consumer keep rules) actually run.
+      - name: Build R8-minified release APK
+        run: ./gradlew :androidApp:assembleRelease --stacktrace
+      - name: Assert the APKs contain libwgbridge.so
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(androidApp/build/outputs/apk/debug/*.apk androidApp/build/outputs/apk/release/*.apk)
+          [ "${#apks[@]}" -ge 2 ] || { echo "::error::expected a debug and a release APK, found: ${apks[*]:-none}"; exit 1; }
+          for apk in "${apks[@]}"; do
+            listing="$(unzip -l "$apk")"
+            for abi in arm64-v8a x86_64; do
+              if ! grep -q "lib/$abi/libwgbridge.so" <<<"$listing"; then
+                echo "::error::$apk does not contain lib/$abi/libwgbridge.so"
+                exit 1
+              fi
+            done
+            for asset in assets/LICENSE assets/THIRD_PARTY_NOTICES.md; do
+              if ! grep -q " $asset\$" <<<"$listing"; then
+                echo "::error::$apk does not contain $asset"
+                exit 1
+              fi
+            done
+            for bad in armeabi-v7a x86/; do
+              if grep -q "lib/$bad" <<<"$listing"; then
+                echo "::error::$apk contains unexpected ABI lib/$bad"
+                exit 1
+              fi
+            done
+            # The JNI class and its native method names must survive R8 (consumer keep rule).
+            unzip -p "$apk" 'classes*.dex' > "$RUNNER_TEMP/classes.dex.bin"
+            for sym in 'Lorg/terminalmax/core/wireguard/WgBridgeNative;' nativeStart nativeOpenForward nativeStats nativeRebind nativeStop; do
+              if ! grep -aq -- "$sym" "$RUNNER_TEMP/classes.dex.bin"; then
+                echo "::error::$apk lost $sym (R8 keep rule not applied?)"
+                exit 1
+              fi
+            done
+            echo "OK: $apk"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: terminalmax-debug-apk
+          path: androidApp/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+  desktop-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Build libwgbridge.dylib
+        shell: bash
+        run: cd native/wgbridge && go mod download && go mod verify && bash build-desktop.sh
+      - name: Copy libwgbridge.dylib into the app resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktopApp/resources/macos-arm64
+          cp native/wgbridge/out/macos-arm64/libwgbridge.dylib desktopApp/resources/macos-arm64/
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - name: Package desktop distribution
+        run: ./gradlew :desktopApp:packageDistributionForCurrentOS --stacktrace
+      # Inspect the final .dmg itself (mounted read-only), not the intermediate copies under build/compose.
+      - name: Assert the DMG contains libwgbridge.dylib and the JNA stub
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmgs=(desktopApp/build/compose/binaries/main/dmg/*.dmg)
+          [ "${#dmgs[@]}" -eq 1 ] || { echo "::error::expected exactly one .dmg, found: ${dmgs[*]:-none}"; exit 1; }
+          mnt="$(mktemp -d "$RUNNER_TEMP/tmx-dmg.XXXXXX")"
+          detach() { hdiutil detach "$mnt" -quiet || hdiutil detach "$mnt" -force -quiet || true; }
+          trap detach EXIT
+          # The DMG carries a license agreement (licenseFile): answer its prompt on stdin.
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "${dmgs[0]}" <<<"Y"
+          app="$(find "$mnt" -maxdepth 1 -name '*.app' -print -quit)"
+          [ -n "$app" ] || { echo "::error::no .app inside ${dmgs[0]}"; ls -la "$mnt"; exit 1; }
+          res="$app/Contents/app/resources"
+          for f in libwgbridge.dylib libjnidispatch.jnilib LICENSE THIRD_PARTY_NOTICES.md; do
+            if [ ! -f "$res/$f" ]; then
+              echo "::error::$f missing from $res inside the DMG"
+              find "$app" \( -name '*wgbridge*' -o -name '*jnidispatch*' \) -print
+              exit 1
+            fi
+            case "$f" in *.dylib|*.jnilib) file "$res/$f"; codesign -dv "$res/$f" 2>&1 | head -n 5 || true ;; esac
+          done
+          file "$res/libwgbridge.dylib" | grep -q arm64 || { echo "::error::libwgbridge.dylib is not arm64"; exit 1; }
+          codesign --verify --strict "$res/libwgbridge.dylib"
+          echo "OK: $app"
+      # First proof that the PACKAGED app can load JNA and the bridge: run the launcher inside the built
+      # .app (createDistributable output, the same image the DMG is made from) with --self-test.
+      - name: Self-test the packaged macOS app (JNA + bridge load)
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          ./gradlew :desktopApp:createDistributable --stacktrace
+          bin="desktopApp/build/compose/binaries/main/app/TerminalMax.app/Contents/MacOS/TerminalMax"
+          [ -x "$bin" ] || { echo "::error::launcher not found: $bin"; find desktopApp/build/compose/binaries/main/app -maxdepth 4 | head -n 40; exit 1; }
+          out="$RUNNER_TEMP/tmx-selftest.txt"
+          rm -f "$out"
+          set +e
+          "$bin" "--self-test=$out" > "$RUNNER_TEMP/tmx-selftest.stdout" 2> "$RUNNER_TEMP/tmx-selftest.stderr"
+          rc=$?
+          set -e
+          echo "exit code: $rc"
+          echo "--- stdout"; cat "$RUNNER_TEMP/tmx-selftest.stdout" || true
+          echo "--- stderr"; cat "$RUNNER_TEMP/tmx-selftest.stderr" || true
+          echo "--- result file"; cat "$out" || true
+          [ "$rc" -eq 0 ] || { echo "::error::packaged app self-test exited with $rc"; exit 1; }
+          [ -f "$out" ] || { echo "::error::self-test wrote no result file"; exit 1; }
+          grep -qx 'SELFTEST OK' "$out" || { echo "::error::no SELFTEST OK line in the result file"; exit 1; }
+          grep -q '^wgbridge version: ' "$out" || { echo "::error::bridge version missing"; exit 1; }
+          grep -q '^jna stub: .*/Contents/app/resources/libjnidispatch.jnilib$' "$out" \
+            || { echo "::error::JNA did not use the bundled stub"; exit 1; }
+          grep -q '^bridge library: .*/Contents/app/resources/libwgbridge.dylib$' "$out" \
+            || { echo "::error::the bridge was not loaded from the app resources"; exit 1; }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: terminalmax-macos-arm64-dmg
+          path: desktopApp/build/compose/binaries/main/dmg/*.dmg
+          if-no-files-found: error
+
+  desktop-windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Build wgbridge.dll
+        shell: bash
+        run: cd native/wgbridge && go mod download && go mod verify && bash build-desktop.sh
+      - name: Copy wgbridge.dll into the app resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktopApp/resources/windows-x64
+          cp native/wgbridge/out/windows-x64/wgbridge.dll desktopApp/resources/windows-x64/
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - name: Package desktop distribution
+        run: ./gradlew :desktopApp:packageDistributionForCurrentOS --stacktrace
+        shell: bash
+      # Administrative install (msiexec /a) extracts the files of the final .msi without installing it.
+      - name: Assert the MSI contains wgbridge.dll and the JNA stub
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msis = @(Get-ChildItem -Path 'desktopApp/build/compose/binaries/main/msi' -Filter '*.msi')
+          if ($msis.Count -ne 1) { throw "expected exactly one .msi, found $($msis.Count)" }
+          $msi = $msis[0].FullName
+          $target = Join-Path $env:RUNNER_TEMP 'tmx-msi'
+          $log = Join-Path $env:RUNNER_TEMP 'tmx-msi.log'
+          $p = Start-Process -FilePath 'msiexec.exe' -Wait -PassThru -ArgumentList "/a `"$msi`" /qn TARGETDIR=`"$target`" /l*v `"$log`""
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            Get-Content $log -Tail 60
+            throw "msiexec /a failed with exit code $($p.ExitCode)"
+          }
+          foreach ($name in @('wgbridge.dll', 'jnidispatch.dll', 'LICENSE', 'THIRD_PARTY_NOTICES.md')) {
+            $hits = @(Get-ChildItem -Path $target -Recurse -File -Filter $name |
+              Where-Object { $_.FullName -match '\\app\\resources\\[^\\]+$' })
+            if ($hits.Count -ne 1) {
+              Get-ChildItem -Path $target -Recurse -File | Select-Object -ExpandProperty FullName
+              throw "${name}: expected exactly one copy under app\resources inside the MSI, found $($hits.Count)"
+            }
+            Write-Host "OK: $($hits[0].FullName) ($($hits[0].Length) bytes)"
+          }
+      # First proof that the PACKAGED app can load JNA and the bridge. The launcher is a GUI-subsystem
+      # executable that may have no stdout, so the result is read from the file given in --self-test=<path>.
+      - name: Self-test the packaged Windows app (JNA + bridge load)
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./gradlew.bat :desktopApp:createDistributable --stacktrace
+          if ($LASTEXITCODE -ne 0) { throw "createDistributable failed ($LASTEXITCODE)" }
+          $exe = (Resolve-Path 'desktopApp/build/compose/binaries/main/app/TerminalMax/TerminalMax.exe').Path
+          $out = Join-Path $env:RUNNER_TEMP 'tmx-selftest.txt'
+          Remove-Item $out -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath $exe -ArgumentList "--self-test=$out" -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'self-test timed out' }
+          $rc = $p.ExitCode
+          Write-Host "exit code: $rc"
+          if (Test-Path $out) { Write-Host '--- result file'; Get-Content $out } else { Write-Host 'no result file' }
+          if ($rc -ne 0) { throw "packaged app self-test exited with $rc" }
+          if (-not (Test-Path $out)) { throw 'self-test wrote no result file' }
+          $text = Get-Content $out -Raw
+          if ($text -notmatch '(?m)^SELFTEST OK\r?$') { throw 'no SELFTEST OK line in the result file' }
+          if ($text -notmatch '(?m)^wgbridge version: ') { throw 'bridge version missing' }
+          if ($text -notmatch '(?m)^jna stub: .*[\\/]app[\\/]resources[\\/]jnidispatch\.dll\r?$') { throw 'JNA did not use the bundled stub' }
+          if ($text -notmatch '(?m)^bridge library: .*[\\/]app[\\/]resources[\\/]wgbridge\.dll\r?$') { throw 'the bridge was not loaded from the app resources' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: terminalmax-windows-x64-msi
+          path: desktopApp/build/compose/binaries/main/msi/*.msi
+          if-no-files-found: error
+
+  # Core path of the product against a real kernel WireGuard peer: SSH over the token-protected
+  # loopback forwarder, through the userspace tunnel (libwgbridge), to an sshd behind a kernel
+  # WireGuard interface. Fails (does not skip) if the runner cannot create a WireGuard interface.
+  e2e-tunnel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Build libwgbridge.so (linux/amd64)
+        working-directory: native/wgbridge
+        run: go mod download && go mod verify && bash build-desktop.sh
+      - name: Create the kernel WireGuard peer
+        run: |
+          set -euo pipefail
+          if ! command -v wg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y wireguard-tools
+          fi
+          if ! sudo ip link add tmxwg0 type wireguard 2>/tmp/ip-link.err; then
+            cat /tmp/ip-link.err
+            sudo modprobe wireguard || true
+            if ! sudo ip link add tmxwg0 type wireguard; then
+              echo "::error title=Kernel WireGuard unavailable::Cannot create a WireGuard interface on this runner (kernel $(uname -r)); the end-to-end test cannot run."
+              exit 1
+            fi
+          fi
+          d="$RUNNER_TEMP/wg"
+          mkdir -p "$d"
+          (
+            umask 077
+            wg genkey > "$d/server.key"
+            wg pubkey < "$d/server.key" > "$d/server.pub"
+            wg genkey > "$d/client.key"
+            wg pubkey < "$d/client.key" > "$d/client.pub"
+          )
+          echo "::add-mask::$(cat "$d/server.key")"
+          echo "::add-mask::$(cat "$d/client.key")"
+          sudo wg set tmxwg0 listen-port 51999 private-key "$d/server.key" \
+            peer "$(cat "$d/client.pub")" allowed-ips 10.99.0.2/32
+          sudo ip addr add 10.99.0.1/24 dev tmxwg0
+          sudo ip link set tmxwg0 up
+          (
+            umask 077
+            cat > "$d/client.conf" <<EOF
+          [Interface]
+          PrivateKey = $(cat "$d/client.key")
+          Address = 10.99.0.2/32
+
+          [Peer]
+          PublicKey = $(cat "$d/server.pub")
+          Endpoint = 127.0.0.1:51999
+          AllowedIPs = 10.99.0.1/32
+          PersistentKeepalive = 5
+          EOF
+          )
+          echo "TMX_WG_CONFIG=$d/client.conf" >> "$GITHUB_ENV"
+          echo "TMX_WGBRIDGE_LIB=$GITHUB_WORKSPACE/native/wgbridge/out/linux-x64/libwgbridge.so" >> "$GITHUB_ENV"
+          echo "TMX_WG_SERVER_IP=10.99.0.1" >> "$GITHUB_ENV"
+          echo "TMX_WG_CLIENT_IP=10.99.0.2" >> "$GITHUB_ENV"
+          sudo wg show tmxwg0
+          ip -br addr show tmxwg0
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+      - name: Run the end-to-end tunnel test
+        env:
+          TMX_E2E: "1"
+        run: ./gradlew :integration-tests:test --stacktrace
+      - name: Check that the test really ran
+        run: |
+          set -euo pipefail
+          xml=integration-tests/build/test-results/test/TEST-org.terminalmax.integration.TunnelEndToEndTest.xml
+          [ -f "$xml" ] || { echo "::error::missing $xml"; exit 1; }
+          suite="$(grep -m1 '<testsuite ' "$xml")"
+          for attr in 'tests="4"' 'skipped="0"' 'failures="0"' 'errors="0"'; do
+            grep -q " $attr" <<<"$suite" || { echo "::error::test report lacks $attr: $suite"; exit 1; }
+          done
+          grep -q 'wgbridge version:' "$xml" || { echo "::error::the native bridge was never loaded (test skipped?)"; exit 1; }
+      # Independent of the JVM: the kernel peer itself must have exchanged data with the client.
+      - name: Check the kernel peer saw tunnel traffic
+        run: |
+          set -euo pipefail
+          sudo wg show tmxwg0 transfer
+          sudo wg show tmxwg0 transfer | awk '{ if ($2 > 0 && $3 > 0) ok = 1 } END { exit ok ? 0 : 1 }' \
+            || { echo "::error::kernel peer transferred no data in both directions"; exit 1; }
+      - name: Diagnostics
+        if: failure()
+        run: |
+          sudo wg show || true
+          ip -br addr || true
+          uname -r
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: e2e-tunnel-test-report
+          path: integration-tests/build/reports/tests/test/
+          if-no-files-found: ignore

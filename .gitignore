@@ -33,3 +33,8 @@ native/build/
 *.dylib
 *.dll
 *.a
+
+# Native libraries built by CI (never committed)
+native/wgbridge/out/
+androidApp/src/main/jniLibs/
+desktopApp/resources/

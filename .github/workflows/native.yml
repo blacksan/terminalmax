@@ -1,0 +1,113 @@
+name: native
+
+on:
+  push:
+    paths:
+      - "native/**"
+      - ".github/workflows/native.yml"
+  pull_request:
+    paths:
+      - "native/**"
+      - ".github/workflows/native.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: native/wgbridge
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.24.x"
+          cache: false
+      # go.sum is committed: `go mod download` checks every module against it and `go mod verify`
+      # re-hashes the module cache. (`go mod tidy -diff` is deliberately not run: it needs network
+      # access to resolve test-only dependencies of dependencies and was not verified for this module.)
+      - name: go mod download && go mod verify
+        run: go mod download && go mod verify
+      - name: go vet
+        run: go vet ./...
+      - name: go test (unit tests, race detector)
+        run: go test ./wgconf/ ./forward/ ./cmd/... -race -count=1
+      # The tunnel integration test runs two real wireguard-go devices over
+      # loopback UDP; it is kept out of the -race run on purpose.
+      - name: go test (tunnel integration, no race detector)
+        run: go test ./tunnel/ -count=1 -timeout 180s -v
+
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.24.x"
+          cache: false
+      # go.sum is committed: download checks every module against it, verify re-hashes the cache.
+      - name: go mod download && go mod verify
+        run: go mod download && go mod verify
+      - name: Build libwgbridge.so
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./build-android.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: libwgbridge-android
+          path: native/wgbridge/out/android/
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.24.x"
+          cache: false
+      # go.sum is committed: download checks every module against it, verify re-hashes the cache.
+      - name: go mod download && go mod verify
+        run: go mod download && go mod verify
+      - name: Build libwgbridge.dylib
+        shell: bash
+        run: ./build-desktop.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: libwgbridge-macos-arm64
+          path: native/wgbridge/out/macos-arm64/
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.24.x"
+          cache: false
+      # go.sum is committed: download checks every module against it, verify re-hashes the cache.
+      - name: go mod download && go mod verify
+        shell: bash
+        run: go mod download && go mod verify
+      - name: Build wgbridge.dll
+        shell: bash
+        run: ./build-desktop.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: libwgbridge-windows-x64
+          path: native/wgbridge/out/windows-x64/
+          if-no-files-found: error
