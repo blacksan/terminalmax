@@ -53,5 +53,18 @@ internal fun formatForwardTarget(targetIp: String, port: Int): String {
         if (!ok) throw IllegalArgumentException("targetIp must be an IP literal without brackets or zone")
     }
     if (port !in 1..65535) throw IllegalArgumentException("port must be in 1..65535")
-    return if (targetIp.contains(':')) "[$targetIp]:$port" else "$targetIp:$port"
+    val colons = targetIp.count { it == ':' }
+    return when {
+        // IPv6 needs at least two colons; a single colon is a host:port pair, not an address.
+        colons >= 2 -> "[$targetIp]:$port"
+        colons == 0 && isDottedQuad(targetIp) -> "$targetIp:$port"
+        else -> throw IllegalArgumentException("targetIp must be an IPv4 or IPv6 literal")
+    }
+}
+
+private fun isDottedQuad(s: String): Boolean {
+    val parts = s.split('.')
+    return parts.size == 4 && parts.all { p ->
+        p.isNotEmpty() && p.length <= 3 && p.all { it in '0'..'9' } && p.toInt() <= 255
+    }
 }
