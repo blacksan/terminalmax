@@ -22,12 +22,54 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      # go.sum is not committed yet (see native.yml).
+      - name: go mod tidy
+        working-directory: native/wgbridge
+        run: go mod tidy
+      - name: Build libwgbridge.so (arm64-v8a, x86_64)
+        working-directory: native/wgbridge
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" ./build-android.sh
+      # The libraries are built here, never committed; Gradle packages src/main/jniLibs/<abi>/.
+      - name: Copy libwgbridge.so into the app
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a x86_64; do
+            mkdir -p "androidApp/src/main/jniLibs/$abi"
+            cp "native/wgbridge/out/android/$abi/libwgbridge.so" "androidApp/src/main/jniLibs/$abi/libwgbridge.so"
+          done
+          find androidApp/src/main/jniLibs -type f
       - uses: gradle/actions/setup-gradle@v6
       - name: Build debug APK and run tests
         run: ./gradlew :androidApp:assembleDebug desktopTest --continue
       # Unsigned is fine: this only makes R8 (and the consumer keep rules) actually run.
       - name: Build R8-minified release APK
         run: ./gradlew :androidApp:assembleRelease --stacktrace
+      - name: Assert the APKs contain libwgbridge.so
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(androidApp/build/outputs/apk/debug/*.apk androidApp/build/outputs/apk/release/*.apk)
+          [ "${#apks[@]}" -ge 2 ] || { echo "::error::expected a debug and a release APK, found: ${apks[*]:-none}"; exit 1; }
+          for apk in "${apks[@]}"; do
+            listing="$(unzip -l "$apk")"
+            for abi in arm64-v8a x86_64; do
+              if ! grep -q "lib/$abi/libwgbridge.so" <<<"$listing"; then
+                echo "::error::$apk does not contain lib/$abi/libwgbridge.so"
+                exit 1
+              fi
+            done
+            for bad in armeabi-v7a x86/; do
+              if grep -q "lib/$bad" <<<"$listing"; then
+                echo "::error::$apk contains unexpected ABI lib/$bad"
+                exit 1
+              fi
+            done
+            echo "OK: $apk"
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: terminalmax-debug-apk
@@ -44,9 +86,29 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Build libwgbridge.dylib
+        shell: bash
+        run: cd native/wgbridge && go mod tidy && bash build-desktop.sh
+      - name: Copy libwgbridge.dylib into the app resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktopApp/resources/macos-arm64
+          cp native/wgbridge/out/macos-arm64/libwgbridge.dylib desktopApp/resources/macos-arm64/
       - uses: gradle/actions/setup-gradle@v6
       - name: Package desktop distribution
         run: ./gradlew :desktopApp:packageDistributionForCurrentOS --stacktrace
+      - name: Assert the packaged app contains libwgbridge.dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          found="$(find desktopApp/build/compose -name libwgbridge.dylib -print)"
+          [ -n "$found" ] || { echo "::error::libwgbridge.dylib missing from the packaged app"; exit 1; }
+          echo "$found"
       - uses: actions/upload-artifact@v7
         with:
           name: terminalmax-macos-arm64-dmg
@@ -63,12 +125,128 @@ jobs:
         with:
           distribution: temurin
           java-version: 21
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Build wgbridge.dll
+        shell: bash
+        run: cd native/wgbridge && go mod tidy && bash build-desktop.sh
+      - name: Copy wgbridge.dll into the app resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p desktopApp/resources/windows-x64
+          cp native/wgbridge/out/windows-x64/wgbridge.dll desktopApp/resources/windows-x64/
       - uses: gradle/actions/setup-gradle@v6
       - name: Package desktop distribution
         run: ./gradlew :desktopApp:packageDistributionForCurrentOS --stacktrace
         shell: bash
+      - name: Assert the packaged app contains wgbridge.dll
+        shell: bash
+        run: |
+          set -euo pipefail
+          found="$(find desktopApp/build/compose -name wgbridge.dll -print)"
+          [ -n "$found" ] || { echo "::error::wgbridge.dll missing from the packaged app"; exit 1; }
+          echo "$found"
       - uses: actions/upload-artifact@v7
         with:
           name: terminalmax-windows-x64-msi
           path: desktopApp/build/compose/binaries/main/msi/*.msi
           if-no-files-found: error
+
+  # Core path of the product against a real kernel WireGuard peer: SSH over the token-protected
+  # loopback forwarder, through the userspace tunnel (libwgbridge), to an sshd behind a kernel
+  # WireGuard interface. Fails (does not skip) if the runner cannot create a WireGuard interface.
+  e2e-tunnel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.x"
+          cache: false
+      - name: Build libwgbridge.so (linux/amd64)
+        working-directory: native/wgbridge
+        run: go mod tidy && bash build-desktop.sh
+      - name: Create the kernel WireGuard peer
+        run: |
+          set -euo pipefail
+          if ! command -v wg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y wireguard-tools
+          fi
+          if ! sudo ip link add tmxwg0 type wireguard 2>/tmp/ip-link.err; then
+            cat /tmp/ip-link.err
+            sudo modprobe wireguard || true
+            if ! sudo ip link add tmxwg0 type wireguard; then
+              echo "::error title=Kernel WireGuard unavailable::Cannot create a WireGuard interface on this runner (kernel $(uname -r)); the end-to-end test cannot run."
+              exit 1
+            fi
+          fi
+          d="$RUNNER_TEMP/wg"
+          mkdir -p "$d"
+          (
+            umask 077
+            wg genkey > "$d/server.key"
+            wg pubkey < "$d/server.key" > "$d/server.pub"
+            wg genkey > "$d/client.key"
+            wg pubkey < "$d/client.key" > "$d/client.pub"
+          )
+          echo "::add-mask::$(cat "$d/server.key")"
+          echo "::add-mask::$(cat "$d/client.key")"
+          sudo wg set tmxwg0 listen-port 51999 private-key "$d/server.key" \
+            peer "$(cat "$d/client.pub")" allowed-ips 10.99.0.2/32
+          sudo ip addr add 10.99.0.1/24 dev tmxwg0
+          sudo ip link set tmxwg0 up
+          (
+            umask 077
+            cat > "$d/client.conf" <<EOF
+          [Interface]
+          PrivateKey = $(cat "$d/client.key")
+          Address = 10.99.0.2/32
+
+          [Peer]
+          PublicKey = $(cat "$d/server.pub")
+          Endpoint = 127.0.0.1:51999
+          AllowedIPs = 10.99.0.1/32
+          PersistentKeepalive = 5
+          EOF
+          )
+          echo "TMX_WG_CONFIG=$d/client.conf" >> "$GITHUB_ENV"
+          echo "TMX_WGBRIDGE_LIB=$GITHUB_WORKSPACE/native/wgbridge/out/linux-x64/libwgbridge.so" >> "$GITHUB_ENV"
+          echo "TMX_WG_SERVER_IP=10.99.0.1" >> "$GITHUB_ENV"
+          sudo wg show tmxwg0
+          ip -br addr show tmxwg0
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Run the end-to-end tunnel test
+        env:
+          TMX_E2E: "1"
+        run: ./gradlew :integration-tests:test --stacktrace
+      - name: Check that the test really ran
+        run: |
+          set -euo pipefail
+          xml=integration-tests/build/test-results/test/TEST-org.terminalmax.integration.TunnelEndToEndTest.xml
+          [ -f "$xml" ] || { echo "::error::missing $xml"; exit 1; }
+          grep -q 'tests="4"' "$xml" || { echo "::error::expected 4 tests"; exit 1; }
+          grep -q 'failures="0"' "$xml" || { echo "::error::failures reported"; exit 1; }
+          grep -q 'wgbridge version:' "$xml" || { echo "::error::the native bridge was never loaded (test skipped?)"; exit 1; }
+      - name: Diagnostics
+        if: failure()
+        run: |
+          sudo wg show || true
+          ip -br addr || true
+          uname -r
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: e2e-tunnel-test-report
+          path: integration-tests/build/reports/tests/test/
+          if-no-files-found: ignore

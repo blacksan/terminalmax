@@ -23,6 +23,8 @@ dependencies {
     implementation(projects.feature.proof)
     // Not referenced by the proof UI yet; listed so desktop packaging sees the SSH module.
     implementation(projects.core.ssh)
+    // JNA binding of libwgbridge; the library itself is bundled from resources/<os>-<arch>/.
+    implementation(projects.core.wireguard)
     implementation(compose.desktop.currentOs)
     implementation(libs.kotlinx.coroutines.swing)
     // Explicit slf4j binding: terminal output and SSH details must never reach a logger by accident.
@@ -39,6 +41,12 @@ compose.desktop {
             // dmg/msi require MAJOR > 0, so this is independent of the app versionName.
             packageVersion = "1.0.0"
             licenseFile.set(rootProject.file("LICENSE"))
+            // CI copies the freshly built libwgbridge.dylib / wgbridge.dll into
+            // resources/macos-arm64/ and resources/windows-x64/ before packaging; the app finds
+            // them through the compose.application.resources.dir system property.
+            appResourcesRootDir.set(project.layout.projectDirectory.dir("resources"))
+            // JNA needs sun.misc.Unsafe-style access (jdk.unsupported) and java.logging in the jlink image.
+            modules("jdk.unsupported", "java.logging")
             macOS {
                 bundleID = "org.terminalmax.desktop"
             }
