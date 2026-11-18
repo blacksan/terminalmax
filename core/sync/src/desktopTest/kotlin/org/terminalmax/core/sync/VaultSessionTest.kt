@@ -3,6 +3,7 @@ package org.terminalmax.core.sync
 
 import java.io.File
 import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.random.Random
 import kotlin.test.AfterTest
@@ -12,6 +13,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
@@ -547,5 +549,372 @@ class VaultSessionTest {
         a.changePassword("pw".toCharArray(), "new".toCharArray())
         assertEquals(2L, a.keyEpoch.value)
         assertNotEquals(before, a.fingerprint())
+    }
+
+    // ------------------------------------------------------------------ fourth review: U-S1 .. U-S13
+
+    private fun reasonOf(r: SyncResult): FailureReason = (r.outcome as SyncOutcome.Failed).reason
+
+    private fun pendingOf(d: File): ByteArray? = runBlocking { FileLocalStateStore(d).load().vaults.values.single().pendingLocalFile }
+
+    @Test
+    fun anEditDuringTheUploadOfAPasswordChangeSurvivesACrashInBothFilesAndNothingIsStranded() = runBlocking<Unit> {
+        val s = server()
+        val d = dir()
+        val a = create(d)
+        a.addHost("one", "h1")
+        a.sync(remote(s))
+        s.beforeNextPut = {
+            runBlocking { a.addHost("during", "h2") }
+            throw RuntimeException("connection dropped")
+        }
+        val result = a.changePassword("pw".toCharArray(), "new".toCharArray(), remote(s))
+        s.beforeNextPut = null
+        assertIs<SyncOutcome.Failed>(result.sync.outcome)
+        a.close()
+
+        // The old password still opens the committed (old-epoch) file, with the edit.
+        val viaOld = VaultSession.open(d, "pw".toCharArray(), tuning = tuning)
+        assertEquals(setOf("h1", "h2"), viaOld.content.value.records.map { it.id }.toSet())
+        assertTrue(viaOld.hasUnresolvedPasswordChange)
+        viaOld.close()
+
+        // The new password opens the pending file, with the edit too; the old file is kept.
+        val viaNew = VaultSession.open(d, "new".toCharArray(), tuning = tuning).also { cleanup += it }
+        assertEquals(setOf("h1", "h2"), viaNew.content.value.records.map { it.id }.toSet())
+        viaNew.addHost("after", "h3")
+        viaNew.close()
+        val state = FileLocalStateStore(d).load().vaults.values.single()
+        assertNotNull(state.localFile)
+        assertNotNull(state.pendingLocalFile)
+        assertTrue(state.pendingHoldsNewerEdits)
+        assertEquals(1L, VaultCodec.inspect(state.localFile!!).keyEpoch, "the old-epoch file is not overwritten")
+
+        // The old password now sees edits that only the pending file has and refuses to drop them silently.
+        val again = VaultSession.open(d, "pw".toCharArray(), tuning = tuning).also { cleanup += it }
+        assertEquals(FailureReason.PendingRotationHoldsNewerEdits, reasonOf(again.sync(remote(s))))
+        val resolved = again.resolvePendingPasswordChange(remote(s), "new".toCharArray())
+        assertEquals(PendingResolution.Abandoned, resolved.resolution)
+        assertEquals(setOf("h1", "h2", "h3"), again.content.value.records.map { it.id }.toSet(), "no edit is lost")
+        assertEquals(1L, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).keyEpoch)
+        assertTrue(resolved.sync.warnings.any { it is SyncWarning.PasswordChangeNotPublished })
+        assertEquals(null, pendingOf(d))
+    }
+
+    @Test
+    fun anUnpublishedPasswordChangeIsPublishedByResolvingItWithTheNewPassword() = runBlocking<Unit> {
+        val s = server()
+        val (d, _) = dropRotationUpload(s)
+        val viaNew = VaultSession.open(d, "new".toCharArray(), tuning = tuning).also { cleanup += it }
+        assertFailsWith<VaultException.BadPasswordOrCorrupt> {
+            viaNew.resolvePendingPasswordChange(remote(s), "pw".toCharArray())
+        }
+        val resolved = viaNew.resolvePendingPasswordChange(remote(s), "new".toCharArray())
+        assertEquals(PendingResolution.Published, resolved.resolution, "${resolved.sync.outcome}")
+        assertEquals(2L, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).keyEpoch)
+        assertFalse(viaNew.hasUnresolvedPasswordChange)
+        assertEquals(null, pendingOf(d))
+        assertEquals(PendingResolution.NothingPending, viaNew.resolvePendingPasswordChange(remote(s), "new".toCharArray()).resolution)
+    }
+
+    @Test
+    fun aDiscardedPasswordChangeIsReportedByEverySyncAndAcrossRestartsUntilAcknowledged() = runBlocking<Unit> {
+        val s = server()
+        val (d, _) = dropRotationUpload(s)
+        val viaOld = VaultSession.open(d, "pw".toCharArray(), tuning = tuning).also { cleanup += it }
+        assertTrue(viaOld.sync(remote(s)).warnings.any { it is SyncWarning.PasswordChangeNotPublished })
+        assertTrue(viaOld.sync(remote(s)).warnings.any { it is SyncWarning.PasswordChangeNotPublished }, "every later sync repeats it")
+        viaOld.close()
+        val reopened = VaultSession.open(d, "pw".toCharArray(), tuning = tuning).also { cleanup += it }
+        assertTrue(reopened.sync(remote(s)).warnings.any { it is SyncWarning.PasswordChangeNotPublished }, "it survives a restart")
+        reopened.acknowledgePasswordChangeWarning()
+        assertTrue(reopened.sync(remote(s)).warnings.none { it is SyncWarning.PasswordChangeNotPublished })
+    }
+
+    @Test
+    fun aRemoteThatClaimsAnAbsurdEpochCannotDisableFutureRotations() = runBlocking<Unit> {
+        val s = server()
+        val a = create(dir())
+        a.addHost("one", "h1")
+        a.sync(remote(s))
+        val current = VaultCodec.open(s.files.getValue(FakeDavServer.VAULT), "pw".toCharArray())
+        val evil = VaultCodec.changePassword(
+            VaultCodec.create("evil".toCharArray(), fast, vaultId = a.id), "evil2".toCharArray(), atLeastEpoch = 0xFFFF_FFFEL,
+        )
+        s.files[FakeDavServer.VAULT] = VaultCodec.seal(evil.withContent(current.content.copy(revision = current.content.revision + 1)))
+        val pulled = a.sync(remote(s), reopenPassword = "pw".toCharArray())
+        assertEquals(FailureReason.BadPasswordOrCorrupt, reasonOf(pulled))
+        val replaced = a.replaceRemoteWithLocal(remote(s), "pw".toCharArray(), confirm = true)
+        assertTrue(replaced.replaced, "${replaced.sync.outcome}")
+        assertEquals(2L, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).keyEpoch, "own epoch + 1, never the remote's claim")
+        val next = a.changePassword("pw".toCharArray(), "third".toCharArray(), remote(s))
+        assertTrue(next.rekeyed, "${next.sync.outcome}")
+        assertEquals(3L, a.keyEpoch.value)
+    }
+
+    @Test
+    fun replacingRefusesAFileThatChangedSinceTheOneTheUserWasShownAndTheLinkedRekeyOfAnotherDevice() = runBlocking<Unit> {
+        val s = server()
+        val a = create(dir())
+        a.addHost("one", "h1")
+        a.sync(remote(s))
+        val b = enrol(dir(), s)
+        b.sync(remote(s))
+        a.changePassword("pw".toCharArray(), "new".toCharArray(), remote(s))
+        // B still has the old password and old key: the remote is the verified successor of its own key.
+        val before = s.files.getValue(FakeDavServer.VAULT).copyOf()
+        val refused = b.replaceRemoteWithLocal(remote(s), "pw".toCharArray(), confirm = true)
+        assertFalse(refused.replaced)
+        assertEquals(FailureReason.RemoteRekeyedElsewhere, reasonOf(refused.sync))
+        assertContentEquals(before, s.files.getValue(FakeDavServer.VAULT))
+
+        // A digest other than the judged file's replaces nothing.
+        val c = create(dir())
+        c.addHost("c", "c1")
+        c.sync(remote(s)) // a different vault id: the remote of C is then A's vault
+        val wrong = c.replaceRemoteWithLocal(remote(s), "pw".toCharArray(), confirm = true, expectedRemoteDigest = "00".repeat(32))
+        assertFalse(wrong.replaced)
+        assertContentEquals(before, s.files.getValue(FakeDavServer.VAULT))
+        b.close()
+    }
+
+    @Test
+    fun aRemoteWhoseKeyDerivationIsTooHeavyForThisDeviceIsNeverReplaced() = runBlocking<Unit> {
+        val s = server()
+        val d = dir()
+        val a = create(d)
+        a.addHost("one", "h1")
+        a.sync(remote(s))
+        a.close()
+        val small = VaultSession.open(d, "pw".toCharArray(), memoryCeilingKiB = 8 * 1024, tuning = tuning).also { cleanup += it }
+        val heavy = KdfParams(memoryKiB = 16 * 1024, iterations = 1, parallelism = 1)
+        val big = VaultCodec.changePassword(VaultCodec.open(s.files.getValue(FakeDavServer.VAULT), "pw".toCharArray()), "pw".toCharArray(), heavy)
+        s.files[FakeDavServer.VAULT] = VaultCodec.seal(big)
+        val before = s.files.getValue(FakeDavServer.VAULT).copyOf()
+        val pulled = small.sync(remote(s), reopenPassword = "pw".toCharArray())
+        assertEquals(FailureReason.RemoteKdfTooHeavyForDevice, reasonOf(pulled))
+        val result = small.replaceRemoteWithLocal(remote(s), "pw".toCharArray(), confirm = true)
+        assertFalse(result.replaced)
+        assertEquals(FailureReason.RemoteKdfTooHeavyForDevice, reasonOf(result.sync))
+        assertContentEquals(before, s.files.getValue(FakeDavServer.VAULT))
+    }
+
+    @Test
+    fun aPendingRotationWhoseRemoteMovedToAnotherKeyAdoptsItOnlyWithTheFingerprintAndKeepsLocalEdits() = runBlocking<Unit> {
+        val s = server()
+        val (d, _) = dropRotationUpload(s)
+        forgedUnchainedRekey(s)
+        val viaNew = VaultSession.open(d, "new".toCharArray(), tuning = tuning).also { cleanup += it }
+        viaNew.addHost("local", "h9")
+        val asked = viaNew.sync(remote(s), reopenPassword = "evil2".toCharArray())
+        assertEquals(FailureReason.KeyMismatchSameEpoch, reasonOf(asked))
+        val shown = assertNotNull(asked.failureInfo?.competingKeyFingerprint)
+        val adopted = viaNew.sync(remote(s), SyncOptions(adoptCompetingKeyFingerprint = shown), "evil2".toCharArray())
+        assertFalse(adopted.outcome is SyncOutcome.Failed, "${adopted.outcome}")
+        assertTrue(adopted.warnings.any { it is SyncWarning.PasswordChangeNotPublished }, "the local password change did not happen")
+        assertTrue(viaNew.content.value.records.any { it.id == "h9" }, "local edits are re-applied")
+        assertFalse(viaNew.hasUnresolvedPasswordChange)
+    }
+
+    @Test
+    fun aKeyEpochRollbackIsReportedAndRecoveredByAnExplicitReplacement() = runBlocking<Unit> {
+        val s = server()
+        val a = create(dir())
+        a.addHost("one", "h1")
+        a.sync(remote(s))
+        val old = s.files.getValue(FakeDavServer.VAULT).copyOf()
+        a.changePassword("pw".toCharArray(), "new".toCharArray(), remote(s))
+        s.files[FakeDavServer.VAULT] = old // the server was restored from a backup
+        val result = a.sync(remote(s), SyncOptions(allowRollback = true))
+        assertEquals(FailureReason.KeyEpochRollback, reasonOf(result))
+        val replaced = a.replaceRemoteWithLocal(remote(s), "new".toCharArray(), confirm = true)
+        assertTrue(replaced.replaced, "${replaced.sync.outcome}")
+        assertEquals(3L, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).keyEpoch)
+    }
+
+    @Test
+    fun aMassDeletionByAnotherDeviceNeedsAcceptanceAndCanBeUndoneFromTheHistory() = runBlocking<Unit> {
+        val s = server()
+        val a = create(dir())
+        val ids = (1..12).map { "h$it" }
+        a.edit { e -> ids.forEach { e.upsertHost(host("host $it"), id = it) } }
+        a.sync(remote(s))
+        val b = enrol(dir(), s)
+        b.edit { e -> ids.take(11).forEach { e.delete(it) } }
+        assertEquals(SyncOutcome.Pushed, b.sync(remote(s)).outcome)
+
+        val refused = a.sync(remote(s))
+        assertEquals(FailureReason.LargeRemoteChange, reasonOf(refused))
+        assertEquals(11, refused.remoteChanges.deletedIds.size)
+        assertEquals(12, a.content.value.records.count { !it.deleted }, "nothing was applied")
+
+        val accepted = a.sync(remote(s), SyncOptions(acceptLargeRemoteChange = true))
+        assertFalse(accepted.outcome is SyncOutcome.Failed, "${accepted.outcome}")
+        assertTrue(accepted.warnings.any { it is SyncWarning.LargeRemoteChangeAccepted })
+        assertEquals(1, a.content.value.records.count { !it.deleted })
+        assertEquals(ids.take(11).sorted(), a.restorableRecordIds())
+
+        val restored = a.restoreFromHistory(ids.take(11) + "unknown")
+        assertEquals(ids.take(11), restored.restoredIds)
+        assertEquals(listOf("unknown"), restored.notRestorableIds)
+        assertEquals(12, a.content.value.records.count { !it.deleted })
+        a.sync(remote(s))
+        b.sync(remote(s))
+        assertEquals(12, b.content.value.records.count { !it.deleted }, "the undo replicates like any edit")
+        b.close()
+    }
+
+    @Test
+    fun anEditThatLosesAtCommitTimeIsReportedAsAConflictOfThatSync() = runBlocking<Unit> {
+        val s = server()
+        val a = create(dir())
+        a.addHost("one", "h1")
+        a.sync(remote(s))
+        val b = enrol(dir(), s)
+        b.edit { it.upsertHost(host("b1"), id = "h1") }
+        b.edit { it.upsertHost(host("b2"), id = "h1") }
+        b.edit { it.upsertHost(host("b3"), id = "h1") }
+        b.sync(remote(s))
+        a.addHost("two", "h2") // a pending edit, so that the sync uploads
+        s.beforeNextPut = { runBlocking { a.addHost("late", "h1") } }
+        val result = a.sync(remote(s))
+        s.beforeNextPut = null
+        val merged = assertIs<SyncOutcome.Merged>(result.outcome, "${result.outcome}")
+        assertTrue(merged.conflicts.any { it.winner.id == "h1" }, "${merged.conflicts}")
+        b.close()
+    }
+
+    @Test
+    fun aSecondOpenInTheSameProcessNeverReleasesTheOsLockOfTheLiveSession() = runBlocking<Unit> {
+        val d = dir()
+        val session = create(d)
+        repeat(3) { assertFailsWith<VaultSessionException.DirectoryInUse> { VaultSession.open(d, "pw".toCharArray(), tuning = tuning) } }
+        assertFailsWith<VaultSessionException.DirectoryInUse> { VaultSession.create(d, "pw".toCharArray(), fast, tuning) }
+        assertEquals(LockProbe.IN_USE, LockProbe.runChild(d), "another process still cannot take the directory")
+        session.close()
+        assertEquals(LockProbe.ACQUIRED, LockProbe.runChild(d), "it is free once the session is closed")
+        VaultSession.open(d, "pw".toCharArray(), tuning = tuning).also { cleanup += it }
+    }
+
+    @Test
+    fun theVaultDirectoryAndItsFilesAreOwnerOnlyOnPosix() = runBlocking<Unit> {
+        val parent = dir()
+        if ("posix" !in parent.toPath().fileSystem.supportedFileAttributeViews()) return@runBlocking
+        val d = File(parent, "vault/sub")
+        val session = create(d)
+        session.addHost("one", "h1")
+        session.close()
+        assertEquals("rwx------", PosixFilePermissions.toString(Files.getPosixFilePermissions(d.toPath())))
+        val files = d.listFiles()!!.filter { it.isFile }
+        assertTrue(files.size >= 2, "state and lock files exist: ${files.map { it.name }}")
+        for (f in files) {
+            assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(f.toPath())), f.name)
+        }
+    }
+
+    @Test
+    fun joiningAVaultAuthoredByAnAttackerFailsWithTheWrongPasswordAndShowsAnotherFingerprintWithTheSame() = runBlocking<Unit> {
+        val s = server()
+        val a = create(dir())
+        a.addHost("one", "h1")
+        a.sync(remote(s))
+        val genuine = s.files.getValue(FakeDavServer.VAULT).copyOf()
+        // Under a password of the attacker's own: the user's password opens nothing.
+        s.files[FakeDavServer.VAULT] = VaultCodec.seal(VaultCodec.create("evil".toCharArray(), fast))
+        val d = dir()
+        assertFailsWith<VaultException.BadPasswordOrCorrupt> { VaultSession.join(d, remote(s), "pw".toCharArray(), tuning = tuning) }
+        assertFalse(File(d, FileLocalStateStore.DEFAULT_FILE_NAME).exists(), "nothing was saved")
+        // The same password, another vault: the fingerprint differs from the genuine one.
+        s.files[FakeDavServer.VAULT] = VaultCodec.seal(VaultCodec.create("pw".toCharArray(), fast))
+        VaultSession.join(d, remote(s), "pw".toCharArray(), tuning = tuning).use { preview ->
+            assertNotEquals(a.fingerprint(), preview.fingerprint)
+            assertNotEquals(a.id, preview.vaultId)
+        }
+        s.files[FakeDavServer.VAULT] = genuine
+        VaultSession.join(d, remote(s), "pw".toCharArray(), tuning = tuning).use { preview ->
+            assertEquals(a.fingerprint(), preview.fingerprint)
+        }
+    }
+
+    @Test
+    fun theRollbackFloorsSurviveSalvageAndImport() = runBlocking<Unit> {
+        val s = server()
+        val d = dir()
+        val a = create(d)
+        a.addHost("one", "h1")
+        a.sync(remote(s))
+        val old = s.files.getValue(FakeDavServer.VAULT).copyOf()
+        a.addHost("two", "h2")
+        a.sync(remote(s))
+        val revision = a.content.value.revision
+        a.close()
+        // Damage the checksum of the state file only: the vault inside is intact.
+        val stateFile = File(d, FileLocalStateStore.DEFAULT_FILE_NAME)
+        val bytes = stateFile.readBytes()
+        bytes[6] = (bytes[6].toInt() xor 0x55).toByte()
+        stateFile.writeBytes(bytes)
+        val recovered = assertIs<SalvageResult.Recovered>(VaultSession.salvage(d, "pw".toCharArray()))
+        assertEquals(revision, recovered.floors.highestRevision)
+        assertTrue(recovered.floors.fileDigests.isNotEmpty())
+        val fresh = VaultSession.importBackup(dir(), recovered.sealedVault, "pw".toCharArray(), tuning = tuning, floors = recovered.floors)
+            .also { cleanup += it }
+        s.files[FakeDavServer.VAULT] = old
+        assertEquals(FailureReason.RollbackDetected, reasonOf(fresh.sync(remote(s))), "the older server file is refused")
+    }
+
+    @Test
+    fun migratingToANewVaultReplacesTheRemoteAndMovesTheSession() = runBlocking<Unit> {
+        val s = server()
+        val d = dir()
+        val a = create(d)
+        a.addHost("one", "h1")
+        a.sync(remote(s))
+        val oldId = a.id
+        assertFailsWith<VaultSessionException.ConfirmationRequired> { a.migrateToNewVault("pw".toCharArray(), remote(s)) }
+        val migrated = a.migrateToNewVault("pw".toCharArray(), remote(s), confirm = true)
+        val next = assertNotNull(migrated.session, "${migrated.sync.outcome}").also { cleanup += it }
+        assertNotEquals(oldId, next.id)
+        assertEquals(setOf("h1"), next.content.value.records.map { it.id }.toSet())
+        assertEquals(next.id, VaultCodec.inspect(s.files.getValue(FakeDavServer.VAULT)).vaultId)
+        assertNotNull(migrated.previousVault)
+        assertFailsWith<IllegalStateException> { a.addHost("late", "x") }
+        assertEquals(FailureReason.SessionClosed, reasonOf(a.sync(remote(s))))
+        next.close()
+        val reopened = VaultSession.open(d, "pw".toCharArray(), tuning = tuning).also { cleanup += it }
+        assertEquals(next.id, reopened.id)
+    }
+}
+
+/** A child JVM that tries to take a vault directory's lock, to prove the OS-level lock of this process is intact. */
+object LockProbe {
+    const val ACQUIRED = 10
+    const val IN_USE = 11
+
+    @JvmStatic
+    fun main(args: Array<String>) {
+        val code = try {
+            FileLocalStateStore(File(args[0])).lockDirectory().close()
+            ACQUIRED
+        } catch (e: VaultSessionException.DirectoryInUse) {
+            IN_USE
+        }
+        System.exit(code)
+    }
+
+    fun runChild(dir: File): Int {
+        val path = listOf(
+            LockProbe::class.java, FileLocalStateStore::class.java, VaultCodec::class.java, Unit::class.java,
+            kotlinx.coroutines.sync.Mutex::class.java, kotlinx.serialization.json.Json::class.java,
+            kotlinx.serialization.KSerializer::class.java,
+        ).mapNotNull { runCatching { File(it.protectionDomain.codeSource.location.toURI()).path }.getOrNull() }
+            .distinct().joinToString(File.pathSeparator)
+        val java = File(System.getProperty("java.home"), "bin/java").path
+        val process = ProcessBuilder(java, "-cp", path, LockProbe::class.java.name, dir.path)
+            .redirectErrorStream(true)
+            .start()
+        val output = process.inputStream.readBytes().decodeToString()
+        val code = process.waitFor()
+        check(code == ACQUIRED || code == IN_USE) { "the probe failed with $code: $output" }
+        return code
     }
 }

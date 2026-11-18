@@ -52,7 +52,14 @@ private val historyComparator = Comparator<VaultRecord> { a, b ->
 /** Upper bound on the summed size of all history entries (characters of payload JSON); oldest entries go first. */
 private const val MAX_HISTORY_CHARS = 1024 * 1024
 
-private fun normalizeHistory(records: Collection<VaultRecord>): List<VaultRecord> {
+/**
+ * How many content revisions after a tombstone the **last live version** of the deleted record stays in `history`
+ * (the undo window of an accepted mass deletion, see `VaultSession.restoreFromHistory`). After that window the next
+ * merge scrubs it like every other history entry of the record.
+ */
+const val RESTORE_WINDOW_REVISIONS: Long = 30L
+
+internal fun normalizeHistory(records: Collection<VaultRecord>): List<VaultRecord> {
     val sorted = records.toSet().sortedWith(historyComparator).takeLast(VaultContent.MAX_HISTORY)
     var total = 0L
     for (r in sorted) total += VaultContent.recordSize(r)
@@ -91,9 +98,12 @@ private fun sameRecords(a: List<VaultRecord>, b: List<VaultRecord>): Boolean =
  * [Regression] of that side (nothing is ever removed from a vault except by tombstones, which are records).
  *
  * Secrets are scrubbed from history: when the merged record is a tombstone, every history entry of that id with a
- * revision up to the tombstone's is dropped. History is capped at [VaultContent.MAX_HISTORY] entries and about 1 MiB.
- * History is a union with a cap and pruning, so it converges but is not associative (see the property tests); the
- * join property is claimed for the record set only.
+ * revision up to the tombstone's is dropped, **except the last live version of the record**, which is kept for
+ * [RESTORE_WINDOW_REVISIONS] content revisions after the tombstone so that a deletion that turns out to be wrong
+ * (an accepted mass deletion by another device) can still be undone. After the window it is scrubbed too. History is
+ * capped at [VaultContent.MAX_HISTORY] entries and about 1 MiB, oldest first, so the undo window of a very large
+ * deletion is bounded by that cap. History is a union with a cap and pruning, so it converges but is not
+ * associative (see the property tests); the join property is claimed for the record set only.
  *
  * [localDeviceId] is reserved for attribution and does not influence the result. All inputs are validated.
  *
@@ -187,10 +197,26 @@ fun mergeVaults(base: VaultContent?, local: VaultContent, remote: VaultContent, 
 
     val current = HashMap<String, VaultRecord>(mergedRecords.size * 2 + 1)
     for (rec in mergedRecords) current[rec.id] = rec
+    // The last live version of every record that ends up deleted stays restorable for a while (see the KDoc).
+    val newestInput = maxOf(local.revision, remote.revision)
+    val lastLive = HashMap<String, VaultRecord>()
+    fun offer(h: VaultRecord) {
+        val cur = current[h.id] ?: return
+        if (!cur.deleted || h.deleted || h.revision > cur.revision) return
+        if (newestInput - cur.revision > RESTORE_WINDOW_REVISIONS) return
+        val best = lastLive[h.id]
+        if (best == null || historyComparator.compare(h, best) > 0) lastLive[h.id] = h
+    }
+    for (h in local.history) offer(h)
+    for (h in remote.history) offer(h)
+    for (h in losers) offer(h)
+    for (r in local.records) offer(r)
+    for (r in remote.records) offer(r)
+    val graveyard: Set<VaultRecord> = lastLive.values.toSet()
     val mergedHistory = normalizeHistory(
-        (local.history + remote.history + losers).filterNot { h ->
+        (local.history + remote.history + losers + graveyard).filterNot { h ->
             val cur = current[h.id]
-            cur != null && cur.deleted && h.revision <= cur.revision
+            cur != null && cur.deleted && h.revision <= cur.revision && h !in graveyard
         },
     )
 

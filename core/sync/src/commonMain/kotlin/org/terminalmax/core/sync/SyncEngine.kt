@@ -8,6 +8,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.terminalmax.core.vault.Conflict
 import org.terminalmax.core.vault.MAX_REVISION
 import org.terminalmax.core.vault.MAX_REVISION_JUMP
 import org.terminalmax.core.vault.MergeSide
@@ -17,10 +18,35 @@ import org.terminalmax.core.vault.VaultException
 import org.terminalmax.core.vault.mergeVaults
 
 /**
- * Marks a [SyncEngine.sync] as the replacement of an unreadable (or missing) remote file by a staged key change.
- * [replacedKeyEpoch] is what the caller believes the replaced file's key epoch was (0 when unknown), for the warning.
+ * Marks a [SyncEngine.sync] as the **replacement** of the remote file (which this device cannot merge) by one of its own
+ * files, published unread. What the remote file held is gone from the share, so it is a compare-and-replace:
+ *
+ * @property expectedRemoteDigest SHA-256 (lower-case hex) of the remote file the caller judged unusable; null together
+ *   with [checkExpectation] means "the remote file did not exist"
+ * @property checkExpectation when true, the file read in the attempt must have exactly [expectedRemoteDigest],
+ *   otherwise nothing is replaced ([FailureReason.RemoteChangedDuringRotation]); an attempt that has to be retried
+ *   (lost race) re-reads and fails the same check, so it never overwrites a file it did not judge
+ * @property refuseLinkedSuccessor refuse (with [FailureReason.RemoteRekeyedElsewhere]) when the remote file is the
+ *   verified successor of this device's key (the password was changed on another device)
+ * @property kind what is published
  */
-class ReplaceRemote(val replacedKeyEpoch: Long = 0L)
+class ReplaceRemote(
+    val expectedRemoteDigest: String? = null,
+    val checkExpectation: Boolean = false,
+    val refuseLinkedSuccessor: Boolean = false,
+    val kind: Kind = Kind.Replace,
+) {
+    enum class Kind {
+        /** A staged key change (a new key epoch) over whatever is there; reported as `SyncWarning.RemoteReplaced`. */
+        Replace,
+
+        /** The held key's current file, completing an unpublished password change (the key epoch is the held one). */
+        CompletePending,
+
+        /** The first file of a brand-new vault (another vault id) over the old vault's file; drops the old vault's state. */
+        NewVault,
+    }
+}
 
 /**
  * Synchronises one local [VaultContent] with the remote vault file.
@@ -49,6 +75,8 @@ class ReplaceRemote(val replacedKeyEpoch: Long = 0L)
  * @param requestBudgetMillis the lease is renewed before the vault upload when less than this remains
  * @param probeMaxAgeMillis the cached probe result of a server is used for this long
  * @param view the caller's live local content; without it [sync]'s `local` argument is the content to commit
+ * @param dropVaultOnCommit the vault id whose state entry is removed in the same state write as the first commit (the
+ *   migration to a new vault); null otherwise
  */
 class SyncEngine(
     private val store: RemoteStore,
@@ -63,6 +91,7 @@ class SyncEngine(
     private val requestBudgetMillis: Long = DEFAULT_REQUEST_BUDGET_MILLIS,
     private val probeMaxAgeMillis: Long = DEFAULT_PROBE_MAX_AGE_MILLIS,
     private val view: LocalView? = null,
+    private val dropVaultOnCommit: String? = null,
 ) {
     private sealed interface Step {
         class Done(val result: SyncResult) : Step
@@ -70,11 +99,21 @@ class SyncEngine(
             val reason: FailureReason,
             val detail: String? = null,
             val warnings: List<SyncWarning> = emptyList(),
+            val competingKeyFingerprint: String? = null,
+            val published: Boolean = false,
+            val changes: RemoteChangeSummary = RemoteChangeSummary.EMPTY,
         ) : Step
         class Retry(val reason: FailureReason, val forceLock: Boolean = false) : Step
     }
 
     private val mutex = Mutex()
+
+    /** Facts about the remote file of the sync call that is running (calls are serialised by [mutex]). */
+    private class Trace {
+        var remoteDigest: String? = null
+    }
+
+    private var trace = Trace()
 
     /**
      * Synchronises [local] with the remote file. [local] is a **snapshot**: the network I/O runs without holding
@@ -99,40 +138,52 @@ class SyncEngine(
         reopenPassword: CharArray? = null,
         replace: ReplaceRemote? = null,
     ): SyncResult {
-        val result = try {
-            mutex.withLock { syncLocked(local, options, staged, reopenPassword, replace) }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: VaultException) {
-            failed(local, reasonFor(e), e.message)
-        } catch (e: RemoteAuthException) {
-            failed(local, FailureReason.AuthFailed, e.message)
-        } catch (e: RemoteIoException) {
-            failed(local, FailureReason.Network, e.message)
-        } catch (e: LocalStateException) {
-            failed(local, FailureReason.LocalStateUnavailable, e.message)
-        } catch (e: Exception) {
-            failed(local, FailureReason.Unexpected, e::class.simpleName)
+        val result = mutex.withLock {
+            trace = Trace()
+            try {
+                syncLocked(local, options, staged, reopenPassword, replace)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: VaultException) {
+                failed(local, reasonFor(e), e.message)
+            } catch (e: RemoteAuthException) {
+                failed(local, FailureReason.AuthFailed, e.message)
+            } catch (e: RemoteIoException) {
+                failed(local, FailureReason.Network, e.message)
+            } catch (e: LocalStateException) {
+                failed(local, FailureReason.LocalStateUnavailable, e.message)
+            } catch (e: Exception) {
+                failed(local, FailureReason.Unexpected, e::class.simpleName)
+            }
         }
         return withStickyWarnings(result, local.vaultId)
     }
 
-    /** The unacknowledged re-key warning of the state is part of every result until the user acknowledges it. */
+    /**
+     * The unacknowledged warnings of the state (an adopted re-key that could not be verified or kept the password, a
+     * discarded password change) are part of every result until the user acknowledges them.
+     */
     private suspend fun withStickyWarnings(result: SyncResult, vaultId: String): SyncResult {
-        val chain = try {
-            localState.load().vaults[vaultId]?.chainWarning
+        val vs = try {
+            localState.load().vaults[vaultId]
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             null
         } ?: return result
-        val warning: SyncWarning = if (chain.fromEpoch == chain.toEpoch) {
-            SyncWarning.ConcurrentRekeyAdopted(chain.toEpoch)
-        } else {
-            SyncWarning.KeyEpochChainUnverified(chain.fromEpoch, chain.toEpoch)
+        val sticky = ArrayList<SyncWarning>()
+        vs.chainWarning?.let { chain ->
+            if (chain.fromEpoch == chain.toEpoch) {
+                sticky += SyncWarning.ConcurrentRekeyAdopted(chain.toEpoch)
+            } else if (chain.unverified) {
+                sticky += SyncWarning.KeyEpochChainUnverified(chain.fromEpoch, chain.toEpoch)
+            }
+            if (chain.passwordUnchanged) sticky += SyncWarning.PasswordUnchangedByRekey(chain.fromEpoch, chain.toEpoch)
         }
-        if (result.warnings.any { it == warning }) return result
-        return result.copy(warnings = result.warnings + warning)
+        vs.discardedPendingEpoch?.let { sticky += SyncWarning.PasswordChangeNotPublished(it) }
+        val missing = sticky.filter { w -> result.warnings.none { it == w } }
+        if (missing.isEmpty()) return result
+        return result.copy(warnings = result.warnings + missing)
     }
 
     private suspend fun syncLocked(
@@ -154,7 +205,9 @@ class SyncEngine(
             if (attempt > 1) sleep(backoffMillis(attempt))
             when (val step = attemptOnce(local, capabilities, forceLock, options, staged, reopenPassword, replace)) {
                 is Step.Done -> return step.result
-                is Step.Fail -> return failed(local, step.reason, step.detail, step.warnings)
+                is Step.Fail -> return failed(
+                    local, step.reason, step.detail, step.warnings, step.competingKeyFingerprint, step.published, step.changes,
+                )
                 is Step.Retry -> {
                     lastReason = step.reason
                     if (step.forceLock) forceLock = true
@@ -170,9 +223,11 @@ class SyncEngine(
         is VaultException.BadPasswordOrCorrupt -> FailureReason.BadPasswordOrCorrupt
         is VaultException.IntegrityFailure -> FailureReason.IntegrityFailure
         is VaultException.HeaderMismatchSameEpoch -> FailureReason.HeaderMismatchSameEpoch
-        is VaultException.KeyMismatchSameEpoch -> FailureReason.ReopenRequired
+        is VaultException.KeyMismatchSameEpoch -> FailureReason.KeyMismatchSameEpoch
         is VaultException.KeyEpochMismatch ->
-            if (e.found > e.expected) FailureReason.ReopenRequired else FailureReason.RollbackDetected
+            if (e.found > e.expected) FailureReason.ReopenRequired else FailureReason.KeyEpochRollback
+        // A file this device is too small for is not "invalid": replacing it would destroy a good vault.
+        is VaultException.KdfCostTooHigh -> FailureReason.RemoteKdfTooHeavyForDevice
         else -> FailureReason.InvalidRemoteFile
     }
 
@@ -181,7 +236,20 @@ class SyncEngine(
         reason: FailureReason,
         detail: String?,
         warnings: List<SyncWarning> = emptyList(),
-    ) = SyncResult(SyncOutcome.Failed(reason, detail), local, warnings)
+        competingKeyFingerprint: String? = null,
+        published: Boolean = false,
+        changes: RemoteChangeSummary = RemoteChangeSummary.EMPTY,
+    ): SyncResult {
+        val digest = trace.remoteDigest
+        val info = if (digest != null || competingKeyFingerprint != null || published) {
+            FailureInfo(digest, competingKeyFingerprint, published)
+        } else {
+            null
+        }
+        return SyncResult(
+            SyncOutcome.Failed(reason, detail), local, warnings, remoteChanges = changes, failureInfo = info,
+        )
+    }
 
     private fun backoffMillis(attempt: Int): Long {
         val cap = 100L shl (attempt - 1).coerceAtMost(6)
@@ -221,13 +289,16 @@ class SyncEngine(
         updateServer { it.copy(capabilities = null, probedAtEpochMs = 0L) }
     }
 
-    private class Committed(val content: VaultContent, val editsPending: Boolean)
+    private class Committed(val content: VaultContent, val editsPending: Boolean, val conflicts: List<Conflict>)
 
     /**
      * Commits a successful sync in one state save: floors, digests, the base file and the sealed local file. The
      * local file is sealed from the **join** of [written] and the content the [LocalView] holds right now, so an edit
-     * made while the network I/O ran is never overwritten; [Committed.editsPending] says that there was one. For a
-     * [staged] password change the new key is committed (and the pending rotation cleared) inside the same section.
+     * made while the network I/O ran is never overwritten; [Committed.editsPending] says that there was one, and
+     * [Committed.conflicts] lists the edits that lost to a newer remote version of the same record in that join (they
+     * are in the history; the caller reports them as conflicts). For a [staged] password change the new key is
+     * committed in the same section. [clearsPending] drops the state's pending rotation (a staged change, or a
+     * completed one).
      */
     private suspend fun commitLocal(
         snapshot: VaultContent,
@@ -238,10 +309,12 @@ class SyncEngine(
         digest: String,
         seenRemote: Pair<Long, String>?,
         staged: StagedHeaderChange?,
+        clearsPending: Boolean = staged != null,
     ): Committed = localState.exclusive {
         val current = view?.current() ?: snapshot
         val editsPending = current != snapshot
-        val final = if (editsPending) mergeVaults(snapshot, current, written, deviceId).merged else written
+        val joined = if (editsPending) mergeVaults(snapshot, current, written, deviceId) else null
+        val final = joined?.merged ?: written
         val localFile = if (staged != null) hooks.sealLocalStaged(final, staged) else hooks.sealLocal(final)
         val state = localState.load()
         val previous = state.vaults[written.vaultId] ?: VaultSyncState()
@@ -257,19 +330,30 @@ class SyncEngine(
             highestRevision = maxOf(previous.highestRevision, revision),
             highestKeyEpoch = maxOf(previous.highestKeyEpoch, keyEpoch),
             fileDigests = digests,
-            pendingLocalFile = if (staged != null) null else previous.pendingLocalFile,
+            pendingLocalFile = if (clearsPending) null else previous.pendingLocalFile,
+            pendingHoldsNewerEdits = if (clearsPending) false else previous.pendingHoldsNewerEdits,
         )
-        localState.save(state.copy(vaults = state.vaults + (written.vaultId to updated)))
+        val others = if (dropVaultOnCommit != null) state.vaults - dropVaultOnCommit else state.vaults
+        localState.save(state.copy(vaults = others + (written.vaultId to updated)))
         if (staged != null) hooks.commitStaged(staged)
         view?.committed(final)
-        Committed(final, editsPending)
+        Committed(final, editsPending, joined?.conflicts ?: emptyList())
+    }
+
+    /** An edit that lost at commit time is a conflict of this very sync. */
+    private fun withCommitConflicts(outcome: SyncOutcome, extra: List<Conflict>): SyncOutcome = when {
+        extra.isEmpty() -> outcome
+        outcome is SyncOutcome.Merged -> SyncOutcome.Merged(outcome.conflicts + extra)
+        else -> SyncOutcome.Merged(extra)
     }
 
     /**
      * Persists the sealed local file after a re-key was adopted, before the sync that follows, together with the
-     * unverified-chain warning (kept until acknowledged) and without the superseded pending rotation.
+     * warnings that must survive until acknowledged ([chainWarning]; [discardedPendingEpoch] when the adoption
+     * superseded a password change of this device that never reached the server) and without the superseded pending
+     * rotation.
      */
-    private suspend fun recordAdoptedRekey(snapshot: VaultContent, chainWarning: ChainWarning?) {
+    private suspend fun recordAdoptedRekey(snapshot: VaultContent, chainWarning: ChainWarning?, discardedPendingEpoch: Long?) {
         localState.exclusive {
             val current = view?.current() ?: snapshot
             val sealed = hooks.sealLocal(current)
@@ -281,7 +365,9 @@ class SyncEngine(
                         snapshot.vaultId to previous.copy(
                             localFile = sealed,
                             pendingLocalFile = null,
+                            pendingHoldsNewerEdits = false,
                             chainWarning = chainWarning ?: previous.chainWarning,
+                            discardedPendingEpoch = discardedPendingEpoch ?: previous.discardedPendingEpoch,
                         )
                         ),
                 ),
@@ -289,13 +375,40 @@ class SyncEngine(
         }
     }
 
-    /** Durably stores the sealed new-epoch local file of a password change **before** it is uploaded. */
-    private suspend fun recordPending(vaultId: String, pendingFile: ByteArray?) {
+    /**
+     * Durably stores the sealed new-epoch local file of a password change **before** it is uploaded. It is sealed
+     * from the join of [written] and the content the [LocalView] holds right now, so an edit made after the snapshot
+     * was taken is in it (and every later edit is added by `VaultSession.edit` while the change is in flight): a
+     * crash anywhere afterwards leaves a pending file that is never behind the committed local file.
+     */
+    private suspend fun recordPending(snapshot: VaultContent, written: VaultContent, staged: StagedHeaderChange) {
+        localState.exclusive {
+            val current = view?.current() ?: snapshot
+            val final = if (current != snapshot) mergeVaults(snapshot, current, written, deviceId).merged else written
+            val pending = hooks.sealLocalStaged(final, staged)
+            val state = localState.load()
+            val previous = state.vaults[snapshot.vaultId] ?: VaultSyncState()
+            localState.save(
+                state.copy(
+                    vaults = state.vaults + (
+                        snapshot.vaultId to previous.copy(pendingLocalFile = pending, pendingHoldsNewerEdits = false)
+                        ),
+                ),
+            )
+        }
+    }
+
+    /** Forgets the pending rotation (the upload was refused, so the change did not happen). */
+    private suspend fun clearPending(vaultId: String) {
         localState.exclusive {
             val state = localState.load()
             val previous = state.vaults[vaultId] ?: VaultSyncState()
-            if (previous.pendingLocalFile == null && pendingFile == null) return@exclusive
-            localState.save(state.copy(vaults = state.vaults + (vaultId to previous.copy(pendingLocalFile = pendingFile))))
+            if (previous.pendingLocalFile == null) return@exclusive
+            localState.save(
+                state.copy(
+                    vaults = state.vaults + (vaultId to previous.copy(pendingLocalFile = null, pendingHoldsNewerEdits = false)),
+                ),
+            )
         }
     }
 
@@ -331,6 +444,31 @@ class SyncEngine(
         }
     }
 
+    /** What the merge changed in the records this device had live before it (ids only). */
+    private fun summarize(local: VaultContent, merged: VaultContent): RemoteChangeSummary {
+        val mergedById = merged.records.associateBy { it.id }
+        val localIds = HashSet<String>(local.records.size * 2 + 1)
+        val changed = ArrayList<String>()
+        val deleted = ArrayList<String>()
+        val knownHosts = ArrayList<String>()
+        var live = 0
+        for (l in local.records) {
+            localIds += l.id
+            if (l.deleted) continue
+            live++
+            val m = mergedById[l.id] ?: continue
+            when {
+                m.deleted -> deleted += l.id
+                m != l -> {
+                    changed += l.id
+                    if (m.type == org.terminalmax.core.vault.RecordType.KnownHost) knownHosts += l.id
+                }
+            }
+        }
+        val added = merged.records.filter { it.id !in localIds && !it.deleted }.map { it.id }
+        return RemoteChangeSummary(changed, deleted, added, knownHosts, live)
+    }
+
     private suspend fun readMergeWrite(
         local: VaultContent,
         lease: Lease?,
@@ -344,9 +482,12 @@ class SyncEngine(
         val state = localState.load()
         val vs = state.vaults[local.vaultId] ?: VaultSyncState()
         val remote = store.read()
+        trace.remoteDigest = remote?.let { hooks.fingerprint(it.bytes) }
 
         if (replace != null) {
-            if (staged == null) return Step.Fail(FailureReason.Unexpected, "a replacement needs a staged key change")
+            if (staged == null && replace.kind == ReplaceRemote.Kind.Replace) {
+                return Step.Fail(FailureReason.Unexpected, "a replacement needs a staged key change")
+            }
             return publishReplacement(local, staged, replace, remote, vs, lease, capabilities)
         }
 
@@ -390,14 +531,29 @@ class SyncEngine(
             hooks.decrypt(remote.bytes)
         } catch (e: VaultException) {
             val sameEpoch = e is VaultException.KeyMismatchSameEpoch
+            val higherEpoch = e is VaultException.KeyEpochMismatch && e.found > e.expected
+            if (!sameEpoch && !higherEpoch) throw e // a lower epoch or an unusable file: reported by reasonFor
             val fromEpoch = if (e is VaultException.KeyEpochMismatch) e.expected else hooks.keyEpoch
             val toEpoch = if (e is VaultException.KeyEpochMismatch) e.found else hooks.keyEpoch
-            if (!sameEpoch && !(e is VaultException.KeyEpochMismatch && e.found > e.expected)) throw e
             if (staged != null) {
                 return Step.Fail(
                     FailureReason.HeaderChangedRemotely,
                     "the vault was re-keyed on another device (key epoch $toEpoch)",
                 )
+            }
+            if (sameEpoch) {
+                // A competing key at the SAME epoch cannot be linked to anything this device still holds (it keeps no
+                // previous-epoch key), and a password that opens it may be an OLD one: it is adopted only when the user
+                // confirmed the fingerprint of exactly this file.
+                val claimed = hooks.claimedFingerprint(remote.bytes)
+                if (reopenPassword == null || options.adoptCompetingKeyFingerprint != claimed) {
+                    return Step.Fail(
+                        FailureReason.KeyMismatchSameEpoch,
+                        "a file of the same key epoch ($toEpoch) is under another key; confirm its fingerprint " +
+                            "after checking it on another device",
+                        competingKeyFingerprint = claimed,
+                    )
+                }
             }
             val chain = if (sameEpoch) EpochChain.NotApplicable else hooks.epochChain(remote.bytes)
             val chainWarnings: List<SyncWarning> = when {
@@ -411,17 +567,32 @@ class SyncEngine(
             val reopened = hooks.reopen(remote.bytes, reopenPassword)
             warnings += chainWarnings
             if (reopened.passwordUnchanged) warnings += SyncWarning.PasswordUnchangedByRekey(fromEpoch, toEpoch)
+            // An unpublished password change of this device that this file supersedes is dropped: say so, until
+            // acknowledged. (A file that IS the pending change is the change landing: nothing to report.)
+            val discarded = vs.pendingLocalFile?.let { pending ->
+                try {
+                    if (hooks.sameHeader(remote.bytes, pending)) null else hooks.claimedKeyEpoch(pending)
+                } catch (e: VaultException) {
+                    0L
+                }
+            }
+            if (discarded != null) warnings += SyncWarning.PasswordChangeNotPublished(discarded)
             // The key changed in memory: persist the local file under it right away (so that a restart can open it
-            // with the password that was just typed), and remember an unverifiable chain until it is acknowledged.
+            // with the password that was just typed), and remember what the user must still be told.
             val unverified = sameEpoch || reopened.chain != EpochChain.Verified
-            recordAdoptedRekey(local, if (unverified) ChainWarning(fromEpoch, toEpoch) else null)
+            val sticky = if (unverified || reopened.passwordUnchanged) {
+                ChainWarning(fromEpoch, toEpoch, passwordUnchanged = reopened.passwordUnchanged, unverified = unverified)
+            } else {
+                null
+            }
+            recordAdoptedRekey(local, sticky, discarded)
             hooks.decrypt(remote.bytes)
         }
         val remoteContent = info.content
         if (remoteContent.vaultId != local.vaultId) return Step.Fail(FailureReason.DifferentVault, null, warnings)
         if (info.keyEpoch < floorEpoch) {
             return Step.Fail(
-                FailureReason.RollbackDetected,
+                FailureReason.KeyEpochRollback,
                 "remote key epoch ${info.keyEpoch} is lower than the highest seen ($floorEpoch)",
                 warnings,
             )
@@ -464,6 +635,22 @@ class SyncEngine(
         val staleLocal = merge.regressions.filter { it.ignoredSide == MergeSide.Local }.map { it.recordId }
         if (staleLocal.isNotEmpty()) warnings += SyncWarning.LocalContentWasStale(staleLocal)
 
+        // A remote that deletes or changes a large part of what this device has is not applied without the user's say.
+        val changes = summarize(local, merge.merged)
+        val affected = changes.changedIds.size + changes.deletedIds.size
+        if (affected > maxOf(LARGE_CHANGE_MINIMUM, changes.liveRecordsBefore / 4)) {
+            if (!options.acceptLargeRemoteChange) {
+                return Step.Fail(
+                    FailureReason.LargeRemoteChange,
+                    "the remote would delete ${changes.deletedIds.size} and change ${changes.changedIds.size} of " +
+                        "${changes.liveRecordsBefore} records; nothing was applied",
+                    warnings,
+                    changes = changes,
+                )
+            }
+            warnings += SyncWarning.LargeRemoteChangeAccepted(changes.changedIds.size, changes.deletedIds.size)
+        }
+
         val outcome = when {
             merge.conflicts.isNotEmpty() -> SyncOutcome.Merged(merge.conflicts)
             merge.changedLocally && merge.changedRemotely -> SyncOutcome.Merged(emptyList())
@@ -476,7 +663,12 @@ class SyncEngine(
             val committed = commitLocal(
                 local, merge.merged, remote.bytes, info.keyEpoch, remoteContent.revision, digest, null, null,
             )
-            return Step.Done(SyncResult(outcome, committed.content, warnings, committed.editsPending))
+            return Step.Done(
+                SyncResult(
+                    withCommitConflicts(outcome, committed.conflicts), committed.content, warnings,
+                    committed.editsPending, changes,
+                ),
+            )
         }
 
         var toWrite = merge.merged
@@ -491,7 +683,9 @@ class SyncEngine(
 
         val enc = hooks.encrypt(toWrite)
         val result = store.write(enc.bytes, ifMatchEtag = if (underLock) null else etag, ifNoneMatch = false)
-        return afterWrite(result, enc, toWrite, local, outcome, warnings, underLock, remoteContent.revision to digest, null)
+        return afterWrite(
+            result, enc, toWrite, local, outcome, warnings, underLock, remoteContent.revision to digest, null, changes,
+        )
     }
 
     /**
@@ -526,7 +720,7 @@ class SyncEngine(
         if (lease != null && !renewLease(lease)) return Step.Retry(FailureReason.Locked)
         val enc = hooks.encryptStaged(toWrite, staged)
         // Durable BEFORE the upload: a crash anywhere after this point can be resolved from the state alone.
-        recordPending(local.vaultId, hooks.sealLocalStaged(toWrite, staged))
+        recordPending(local, toWrite, staged)
         val result = store.write(enc.bytes, ifMatchEtag = if (underLock) null else etag, ifNoneMatch = false)
         return afterWrite(
             result, enc, toWrite, local, SyncOutcome.Pushed, warnings, underLock,
@@ -535,13 +729,15 @@ class SyncEngine(
     }
 
     /**
-     * Publishes [staged] over whatever the remote holds, unread: the recovery action for a remote that cannot be
-     * opened (or does not exist). The remote file is replaced only if it is still the one that was just read
-     * (`If-Match`, or the lock lease), and the upload is read back like any other.
+     * Publishes one of this device's own files over whatever the remote holds, **unread** (the recovery actions behind
+     * `VaultSession.replaceRemoteWithLocal`, `resolvePendingPasswordChange` and `migrateToNewVault`). Compare-and-
+     * replace: the file read in this attempt must be the one the caller judged ([ReplaceRemote.checkExpectation]),
+     * the PUT carries `If-Match` of that very read (or happens under the lock lease), and the upload is read back.
+     * A lost race is never retried into a different file: the retry re-reads and fails the expectation.
      */
     private suspend fun publishReplacement(
         local: VaultContent,
-        staged: StagedHeaderChange,
+        staged: StagedHeaderChange?,
         replace: ReplaceRemote,
         remote: RemoteFile?,
         vs: VaultSyncState,
@@ -549,19 +745,55 @@ class SyncEngine(
         capabilities: ServerCapabilities,
     ): Step {
         val underLock = lease != null
+        if (replace.checkExpectation) {
+            val actual = remote?.let { hooks.fingerprint(it.bytes) }
+            if (actual != replace.expectedRemoteDigest) {
+                return Step.Fail(
+                    FailureReason.RemoteChangedDuringRotation,
+                    "the remote file is not the one that was judged (it changed meanwhile); nothing was replaced",
+                )
+            }
+        }
+        if (replace.refuseLinkedSuccessor && remote != null) {
+            val chain = try {
+                hooks.epochChain(remote.bytes)
+            } catch (e: VaultException) {
+                EpochChain.NotApplicable
+            }
+            if (chain == EpochChain.Verified) {
+                return Step.Fail(
+                    FailureReason.RemoteRekeyedElsewhere,
+                    "the remote is the re-key of this device's key: the password was changed on another device",
+                )
+            }
+        }
         val toWrite = local.copy(revision = nextRevision(maxOf(local.revision, vs.highestRevision)))
         val etag = usableEtag(remote?.etag)
         if (remote != null && !underLock && etag == null) return Step.Retry(FailureReason.TooManyAttempts, forceLock = true)
         if (lease != null && !renewLease(lease)) return Step.Retry(FailureReason.Locked)
-        val enc = hooks.encryptStaged(toWrite, staged)
-        recordPending(local.vaultId, hooks.sealLocalStaged(toWrite, staged))
+        val enc = if (staged != null) hooks.encryptStaged(toWrite, staged) else hooks.encrypt(toWrite)
+        if (staged != null) recordPending(local, toWrite, staged)
         val result = if (remote == null) {
             store.write(enc.bytes, ifMatchEtag = null, ifNoneMatch = !underLock || capabilities.honoursIfNoneMatchStar)
         } else {
             store.write(enc.bytes, ifMatchEtag = if (underLock) null else etag, ifNoneMatch = false)
         }
-        val warnings = listOf<SyncWarning>(SyncWarning.RemoteReplaced(staged.keyEpoch, replace.replacedKeyEpoch))
-        return afterWrite(result, enc, toWrite, local, SyncOutcome.Pushed, warnings, underLock, null, staged)
+        val warnings = if (replace.kind == ReplaceRemote.Kind.Replace && staged != null) {
+            val replacedEpoch = remote?.let {
+                try {
+                    hooks.claimedKeyEpoch(it.bytes) // unauthenticated: for the message only
+                } catch (e: VaultException) {
+                    0L
+                }
+            } ?: 0L
+            listOf<SyncWarning>(SyncWarning.RemoteReplaced(staged.keyEpoch, replacedEpoch))
+        } else {
+            emptyList()
+        }
+        return afterWrite(
+            result, enc, toWrite, local, SyncOutcome.Pushed, warnings, underLock, null, staged,
+            clearsPending = staged != null || replace.kind == ReplaceRemote.Kind.CompletePending,
+        )
     }
 
     /**
@@ -578,10 +810,12 @@ class SyncEngine(
         underLock: Boolean,
         seenRemote: Pair<Long, String>?,
         staged: StagedHeaderChange?,
+        changes: RemoteChangeSummary = RemoteChangeSummary.EMPTY,
+        clearsPending: Boolean = staged != null,
     ): Step = when (result) {
         is WriteResult.PreconditionFailed -> {
             // The upload was refused, so the pending rotation (if any) did not happen.
-            if (staged != null) recordPending(written.vaultId, null)
+            if (staged != null) clearPending(written.vaultId)
             Step.Retry(FailureReason.TooManyAttempts)
         }
         is WriteResult.Failed -> Step.Fail(FailureReason.ServerRejected, result.message)
@@ -593,11 +827,31 @@ class SyncEngine(
                 if (!underLock) invalidateProbe()
                 Step.Retry(FailureReason.TooManyAttempts)
             } else {
-                val committed = commitLocal(
-                    snapshot, written, enc.bytes, enc.keyEpoch, written.revision, hooks.fingerprint(enc.bytes),
-                    seenRemote, staged,
-                )
-                Step.Done(SyncResult(outcome, committed.content, warnings, committed.editsPending))
+                try {
+                    val committed = commitLocal(
+                        snapshot, written, enc.bytes, enc.keyEpoch, written.revision, hooks.fingerprint(enc.bytes),
+                        seenRemote, staged, clearsPending,
+                    )
+                    Step.Done(
+                        SyncResult(
+                            withCommitConflicts(outcome, committed.conflicts), committed.content, warnings,
+                            committed.editsPending, changes,
+                        ),
+                    )
+                } catch (e: LocalStateException) {
+                    // The upload landed but this device could not record it: for a password change the new password
+                    // is already live on the server.
+                    if (staged != null) {
+                        Step.Fail(
+                            FailureReason.LocalStateUnavailable,
+                            "the upload landed but could not be recorded locally: " + e.message,
+                            warnings,
+                            published = true,
+                        )
+                    } else {
+                        throw e
+                    }
+                }
             }
         }
     }
@@ -697,6 +951,12 @@ class SyncEngine(
         const val DEFAULT_LEASE_MILLIS: Long = 10 * 60_000L
         const val DEFAULT_REQUEST_BUDGET_MILLIS: Long = 150_000L
         const val DEFAULT_PROBE_MAX_AGE_MILLIS: Long = 7L * 24 * 60 * 60 * 1000
+
+        /**
+         * A pull that deletes or changes more of this device's live records than `max(this, 25%)` is refused unless
+         * the user accepts it ([SyncOptions.acceptLargeRemoteChange]).
+         */
+        const val LARGE_CHANGE_MINIMUM: Int = 10
 
         /** A foreign lock is broken only this long after its expiry when the server's clock is available. */
         const val SERVER_CLOCK_GRACE_MILLIS: Long = 30_000L

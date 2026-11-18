@@ -590,7 +590,7 @@ class SyncEngineTest {
         s.files[FakeDavServer.VAULT] = old
         val puts = s.requests("PUT", FakeDavServer.VAULT).size
         val outcome = b.sync(SyncOptions(allowRollback = true)) // the override never waives the key-epoch floor
-        assertEquals(FailureReason.RollbackDetected, failure(outcome))
+        assertEquals(FailureReason.KeyEpochRollback, failure(outcome))
         assertEquals(puts, s.requests("PUT", FakeDavServer.VAULT).size)
         assertTrue(old.contentEquals(s.files.getValue(FakeDavServer.VAULT)))
     }
@@ -627,7 +627,7 @@ class SyncEngineTest {
         // A can keep syncing; a replayed epoch 1 file is a rollback and is not written over.
         assertEquals(SyncOutcome.Pulled, a.sync())
         s.files[FakeDavServer.VAULT] = old
-        assertEquals(FailureReason.RollbackDetected, failure(a.sync(SyncOptions(allowRollback = true))))
+        assertEquals(FailureReason.KeyEpochRollback, failure(a.sync(SyncOptions(allowRollback = true))))
         assertTrue(old.contentEquals(s.files.getValue(FakeDavServer.VAULT)))
     }
 
@@ -821,10 +821,25 @@ class SyncEngineTest {
         s.files[FakeDavServer.VAULT] = VaultCodec.seal(rival.withContent(a.content.copy(revision = a.content.revision + 1)))
         val puts = s.requests("PUT", FakeDavServer.VAULT).size
         val asked = b.syncResult()
-        assertEquals(FailureReason.ReopenRequired, failure(asked.outcome))
+        // A same-epoch competitor is never adopted on a password alone (a holder of an OLD password could forge it).
+        assertEquals(FailureReason.KeyMismatchSameEpoch, failure(asked.outcome))
+        val shown = assertNotNull(asked.failureInfo?.competingKeyFingerprint)
         assertEquals(puts, s.requests("PUT", FakeDavServer.VAULT).size)
-        assertEquals(FailureReason.BadPasswordOrCorrupt, failure(b.syncResult(password = "pw".toCharArray()).outcome))
-        val opened = b.syncResult(password = "rival".toCharArray())
+        assertEquals(
+            FailureReason.KeyMismatchSameEpoch,
+            failure(b.syncResult(password = "rival".toCharArray()).outcome),
+            "the right password without the fingerprint confirmation adopts nothing",
+        )
+        assertEquals(
+            FailureReason.BadPasswordOrCorrupt,
+            failure(b.syncResult(SyncOptions(adoptCompetingKeyFingerprint = shown), password = "pw".toCharArray()).outcome),
+        )
+        assertEquals(
+            FailureReason.KeyMismatchSameEpoch,
+            failure(b.syncResult(SyncOptions(adoptCompetingKeyFingerprint = "0000-0000"), password = "rival".toCharArray()).outcome),
+            "a fingerprint that is not the one shown confirms nothing",
+        )
+        val opened = b.syncResult(SyncOptions(adoptCompetingKeyFingerprint = shown), password = "rival".toCharArray())
         assertFalse(opened.outcome is SyncOutcome.Failed, "${opened.outcome}")
         assertTrue(opened.warnings.any { it is SyncWarning.ConcurrentRekeyAdopted && it.epoch == 1L }, "${opened.warnings}")
     }

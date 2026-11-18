@@ -76,7 +76,11 @@ set a join (commutative, associative, idempotent), so devices converge whatever 
   types. An older version this device cannot prove it saw is never dropped silently;
 * a record that one side lacks although the base had it is a `Regression` of that side.
 
-When a tombstone wins, older history entries of that id are dropped, so a deleted secret does not linger. History is
+When a tombstone wins, older history entries of that id are dropped, so a deleted secret does not linger, **except
+the last live version**: it is kept (the "graveyard") while the content revision is at most `RESTORE_WINDOW_REVISIONS`
+(30) above the tombstone's, so an accepted mass deletion can be undone (`VaultEditor.restore`,
+`VaultSession.restoreFromHistory`). After the window the next merge scrubs it. A deleted secret therefore lingers in the
+encrypted history for 30 revisions; `VaultEditor.delete` writes the same entry itself. History is
 a capped union (200 entries, about 1 MiB): it converges but is not associative. A new revision is
 `max(record, content) + 1`. Vaults with different ids, a newer schema or content that breaks the validation rules are
 rejected.
@@ -94,6 +98,10 @@ What the format does **not** do by itself:
   fingerprint across devices).
 * Rotation cannot take back copies the removed party already has, and the epoch chain only proves that a re-key was
   made by someone who held the previous key, not that they were still authorised to.
+* The key epoch of a remote file is not authenticated until a key opens it: **never derive an epoch for a new
+  rotation from it.** `changePassword(atLeastEpoch)` must be given a value from authenticated local state only (the
+  sync layer uses its own highest epoch plus one) and refuses (`InvalidContent`) an epoch above `MAX_KEY_EPOCH`; the sync layer stops earlier,
+  with `KEY_EPOCH_HEADROOM` (2^16) epochs left; `migrateToNewVault` is the way out of an exhausted counter.
 * Whoever holds the data key of an epoch (an exported local unlock secret, a compromised device) can re-seal files
   of that epoch with any header. The format cannot stop it; the sync layer refuses such a file on every device that
   holds the same key, and only the password (never the data key) opens a new epoch.

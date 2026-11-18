@@ -7,13 +7,22 @@ import org.terminalmax.core.vault.VaultContent
 class LocalStateException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
 /**
- * A re-key that this device adopted but could not verify, remembered until the user acknowledges it
- * (`VaultSession.acknowledgeKeyEpochWarning`). [fromEpoch] == [toEpoch] means a competing key at the same epoch.
+ * A re-key that this device adopted and that the user must still be told about, remembered until the user
+ * acknowledges it (`VaultSession.acknowledgeKeyEpochWarning`). [fromEpoch] == [toEpoch] means a competing key at the
+ * same epoch. [unverified] is false when the chain verified and only [passwordUnchanged] (the typed password also opens
+ * the slot this device held before: see `SyncWarning.PasswordUnchangedByRekey`) is the reason for the warning.
  */
-data class ChainWarning(val fromEpoch: Long, val toEpoch: Long)
+data class ChainWarning(
+    val fromEpoch: Long,
+    val toEpoch: Long,
+    val passwordUnchanged: Boolean = false,
+    val unverified: Boolean = true,
+)
 
 /**
- * What a device remembers about one vault between syncs. It holds no secrets: [baseFile] is the encrypted file
+ * What a device remembers about one vault between syncs. It holds no secrets (but it is not "nothing": the vault id,
+ * revision and key-epoch floors, file digests and the device id are stored in the clear, see `FileLocalStateStore`):
+ * [baseFile] is the encrypted file
  * exactly as it was last synced (the three-way merge base is decrypted from it with the data key when needed) and
  * [localFile] is the sealed local vault. They live in the same on-disk transaction (see `VaultSession`), so the
  * floors, the base and the local content can never diverge after a crash.
@@ -26,6 +35,10 @@ data class ChainWarning(val fromEpoch: Long, val toEpoch: Long)
  * @property pendingLocalFile the fully sealed **new-epoch** local file of a password change that is being
  *   published: written durably before the upload, cleared once the change is committed (or known not to have
  *   happened). After a crash it is what lets the new password open the vault (see `VaultSession.open`).
+ * @property pendingHoldsNewerEdits the pending file holds edits that the committed [localFile] does not (they were made
+ *   in a session opened with the new password): dropping the pending file would lose them
+ * @property discardedPendingEpoch the key epoch of an unpublished password change that was dropped, until the user
+ *   acknowledges the warning (`SyncWarning.PasswordChangeNotPublished`)
  * @property chainWarning a key epoch change this device adopted without being able to verify its chain, until acknowledged
  * @property highestRevision highest content revision ever read from or written to the remote
  * @property highestKeyEpoch highest key epoch seen
@@ -40,6 +53,8 @@ data class VaultSyncState(
     val fileDigests: Map<Long, String> = emptyMap(),
     val pendingLocalFile: ByteArray? = null,
     val chainWarning: ChainWarning? = null,
+    val pendingHoldsNewerEdits: Boolean = false,
+    val discardedPendingEpoch: Long? = null,
 ) {
     /** True once this device has synced the vault at least once (so a missing remote file is suspicious). */
     val established: Boolean get() = baseFile != null || highestRevision > 0L
@@ -51,6 +66,8 @@ data class VaultSyncState(
             highestKeyEpoch == other.highestKeyEpoch &&
             fileDigests == other.fileDigests &&
             chainWarning == other.chainWarning &&
+            pendingHoldsNewerEdits == other.pendingHoldsNewerEdits &&
+            discardedPendingEpoch == other.discardedPendingEpoch &&
             (baseFile?.contentEquals(other.baseFile) ?: (other.baseFile == null)) &&
             (localFile?.contentEquals(other.localFile) ?: (other.localFile == null)) &&
             (pendingLocalFile?.contentEquals(other.pendingLocalFile) ?: (other.pendingLocalFile == null))
@@ -63,6 +80,8 @@ data class VaultSyncState(
         result = 31 * result + highestKeyEpoch.hashCode()
         result = 31 * result + (pendingLocalFile?.contentHashCode() ?: 0)
         result = 31 * result + (chainWarning?.hashCode() ?: 0)
+        result = 31 * result + pendingHoldsNewerEdits.hashCode()
+        result = 31 * result + (discardedPendingEpoch?.hashCode() ?: 0)
         result = 31 * result + fileDigests.hashCode()
         return result
     }

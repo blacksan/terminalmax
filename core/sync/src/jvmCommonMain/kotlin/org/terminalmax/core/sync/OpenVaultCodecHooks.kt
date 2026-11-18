@@ -20,8 +20,10 @@ import org.terminalmax.core.vault.VaultException
  *
  * Key changes happen in exactly three places, each of which zeroes the superseded key right away: [reopen] (the
  * vault was re-keyed elsewhere; opened with the password), [commitStaged] (a password change this device published)
- * and [close]. Because a password change is committed only after the upload is confirmed, there is never an
- * unpublished newer key to remember, and no old keys are retained.
+ * and [close]. Because a password change is committed only after the upload is confirmed, this object never
+ * holds an unpublished newer key (a session opened from a pending rotation holds that key as its *current* one, and
+ * `VaultSession` keeps the old-epoch file next to it), and no old keys are retained. A competing key at the held
+ * epoch is never adopted here without the caller's fingerprint confirmation (see [claimedFingerprint]).
  *
  * @param memoryCeilingKiB the most memory this device spends on one key derivation; applied to every [reopen]
  */
@@ -160,6 +162,12 @@ internal class OpenVaultCodecHooks(
 
     /** A per-device convenience-unlock secret for the held key (see [OpenVault.exportLocalUnlockSecret]). */
     fun exportLocalUnlockSecret(): ByteArray = synchronized(lock) { current.exportLocalUnlockSecret() }
+
+    override fun sameHeader(a: ByteArray, b: ByteArray): Boolean = VaultCodec.haveSameHeader(a, b)
+
+    override fun claimedKeyEpoch(bytes: ByteArray): Long = VaultCodec.inspect(bytes).keyEpoch
+
+    override fun claimedFingerprint(bytes: ByteArray): String = VaultCodec.claimedFingerprint(bytes)
 
     override fun fingerprint(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }

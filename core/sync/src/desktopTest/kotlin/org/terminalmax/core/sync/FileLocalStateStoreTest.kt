@@ -39,7 +39,9 @@ class FileLocalStateStoreTest {
                 highestKeyEpoch = 2,
                 fileDigests = mapOf(4L to "aa", revision to "bb"),
                 pendingLocalFile = byteArrayOf(5, 4, 3),
-                chainWarning = ChainWarning(1, 2),
+                chainWarning = ChainWarning(1, 2, passwordUnchanged = true, unverified = false),
+                pendingHoldsNewerEdits = true,
+                discardedPendingEpoch = 3L,
             ),
         ),
         servers = mapOf(

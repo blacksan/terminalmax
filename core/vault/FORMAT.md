@@ -204,8 +204,11 @@ Further rules:
 * Record types: Host, Identity, PrivateKey, WireGuardProfile, KnownHost, Snippet, Settings. Unknown record-level
   fields and unknown payload fields are preserved when a vault is rewritten.
 * `history` holds the losing sides of merge conflicts. When a tombstone wins, history entries of that id with a
-  revision up to the tombstone's are dropped (so deleting a secret removes its older versions). History is capped at
-  200 entries and about 1 MiB of text, oldest dropped first.
+  revision up to the tombstone's are dropped (so deleting a secret removes its older versions), **except the last live
+  version** (the highest by revision, device id, canonical JSON), which is kept while the content revision of the merge
+  is at most 30 above the tombstone's (`RESTORE_WINDOW_REVISIONS`): the undo window of an accepted mass deletion. After
+  that the next merge drops it. History is capped at 200 entries and about 1 MiB of text, oldest dropped first (the cap
+  can shorten the window).
 * Deleted records stay as tombstones (`deleted: true`, empty payload). Tombstones are not garbage collected.
 
 There is no digest of the previous file inside the plaintext. Fork detection (two different files at the same
@@ -214,7 +217,10 @@ revision) is done by the sync layer from digests of files it has seen.
 ## Rotation
 
 * `changePassword` is the only operation that touches the slot. It **replaces the data key**: `keyEpoch + 1` (or
-  higher, for a replacement published by `VaultSession.replaceRemoteWithLocal`), a new slot (new salt, new nonce, the
+  higher, when the caller passes `atLeastEpoch`; the sync layer derives it from the device's own authenticated epochs
+  only, never from a remote file's claim). The codec refuses an epoch above `MAX_KEY_EPOCH` (2^32 - 1) with `InvalidContent`; the sync
+  layer refuses already when fewer than `KEY_EPOCH_HEADROOM` (2^16) epochs are left and reports
+  `KeyEpochLimitReached`. The recovery is `VaultCodec.migrateToNewVault`, exposed as `VaultSession.migrateToNewVault`, a new slot (new salt, new nonce, the
   new password and, optionally, new KDF parameters; the slot id is kept), a new `keyCommit`, an `epochLink` to the
   previous epoch and a new `writeSalt` on the next seal.
 * The holder of the old password can no longer read or forge anything written afterwards by a device that did the
@@ -227,9 +233,9 @@ revision) is done by the sync layer from digests of files it has seen.
   password.
 * Two devices that rotate independently to the same epoch produce files the other cannot decrypt. The sync layer
   prevents this for its own password-change transaction (it uploads only if the remote is still exactly what it
-  last synced), and reports a competing key at the same epoch as a re-key that needs the password
-  (`FailureReason.ReopenRequired`; `SyncWarning.ConcurrentRekeyAdopted` once adopted). The format does not merge
-  rotations.
+  last synced), and reports a competing key at the same epoch as `FailureReason.KeyMismatchSameEpoch`, which is **not**
+  adopted on a password alone (a holder of an old password could author it) but only after the user confirms the
+  changed fingerprint (`SyncWarning.ConcurrentRekeyAdopted` once adopted). The format does not merge rotations.
 
 ## Errors
 
@@ -244,7 +250,8 @@ revision) is done by the sync layer from digests of files it has seen.
 | A header with zero or several password slots, or a field this format does not have (for example `headerRevision`) | `InvalidFormat` / `BadPasswordOrCorrupt` (never reaches a key derivation) |
 | Same key epoch, other header than the held one (sync layer) | `HeaderMismatchSameEpoch` |
 | Same key epoch, another data key than the held one (sync layer) | `KeyMismatchSameEpoch` |
-| Authentic file whose content breaks the content rules | `InvalidContent` |
+| Authentic file whose content breaks the content rules; a rotation at the key epoch limit (`changePassword` beyond `MAX_KEY_EPOCH`) | `InvalidContent` |
+| Remote key derivation above this device's ceiling during a replace (sync layer) | `RemoteKdfTooHeavyForDevice` (from `KdfCostTooHigh`) |
 | Key (data key or local unlock secret) of another epoch than the file's | `KeyEpochMismatch` |
 | Another vault id (data-key open, merge) | `DifferentVault` |
 

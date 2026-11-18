@@ -33,6 +33,10 @@ class OpenVault internal constructor(
     /** The key slots in the header (exactly one: the password slot). */
     val slots: List<SlotInfo> get() = header.slots.map { SlotInfo(it.id, it.type) }
 
+    /** The key-derivation parameters of the password slot (what the next password change keeps by default). */
+    val kdfParams: KdfParams
+        get() = header.slots.single().let { KdfParams(it.memoryKiB, it.iterations, it.parallelism) }
+
     /** Ids of the key slots in the header. */
     val slotIds: List<String> get() = header.slots.map { it.id }
 
@@ -44,16 +48,7 @@ class OpenVault internal constructor(
      * epoch and key.
      */
     val fingerprint: String
-        get() {
-            val digest = MessageDigest.getInstance("SHA-256")
-            digest.update(vaultId.toByteArray(Charsets.UTF_8))
-            digest.update('|'.code.toByte())
-            digest.update(keyEpoch.toString().toByteArray(Charsets.US_ASCII))
-            digest.update('|'.code.toByte())
-            digest.update(Base64.Default.decode(header.keyCommit))
-            val hex = digest.digest().copyOf(12).joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
-            return hex.uppercase().chunked(4).joinToString("-")
-        }
+        get() = keyFingerprintOf(vaultId, keyEpoch, Base64.Default.decode(header.keyCommit))
 
     /** True when [other] holds the same data key (compared through the key commitments, in constant time). */
     fun hasSameKeyAs(other: OpenVault): Boolean =
@@ -89,4 +84,16 @@ class OpenVault internal constructor(
     }
 
     override fun toString(): String = "OpenVault(vaultId=$vaultId, revision=${content.revision}, keyEpoch=$keyEpoch)"
+}
+
+/** The comparable key identity of (vault id, key epoch, key commitment); see [OpenVault.fingerprint]. */
+internal fun keyFingerprintOf(vaultId: String, keyEpoch: Long, keyCommit: ByteArray): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    digest.update(vaultId.toByteArray(Charsets.UTF_8))
+    digest.update('|'.code.toByte())
+    digest.update(keyEpoch.toString().toByteArray(Charsets.US_ASCII))
+    digest.update('|'.code.toByte())
+    digest.update(keyCommit)
+    val hex = digest.digest().copyOf(12).joinToString("") { (it.toInt() and 0xff).toString(16).padStart(2, '0') }
+    return hex.uppercase().chunked(4).joinToString("-")
 }

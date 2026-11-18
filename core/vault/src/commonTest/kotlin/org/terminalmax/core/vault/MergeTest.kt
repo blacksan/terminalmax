@@ -378,9 +378,10 @@ class MergeTest {
         val base = content(4, tombstone)
         val result = mergeVaults(base, content(4, tombstone), content(3, live), "A")
         assertTrue(byId(result.merged)["x"]!!.deleted)
-        // The replay cannot be proven to be an ancestor, so it is reported, but the tombstone scrubs it from history.
+        // The replay cannot be proven to be an ancestor, so it is reported. It is also the last live version, so it
+        // stays restorable for the restore window.
         assertEquals(1, result.conflicts.size)
-        assertTrue(result.merged.history.none { it.id == "x" })
+        assertEquals(listOf(3L), result.merged.history.filter { it.id == "x" }.map { it.revision })
     }
 
     @Test
@@ -427,23 +428,57 @@ class MergeTest {
     }
 
     @Test
-    fun aTombstoneThatWinsScrubsTheSecretsOfThatRecordFromHistory() {
+    fun aTombstoneThatWinsScrubsOlderVersionsButKeepsTheLastLiveOneForTheRestoreWindow() {
         val secret = record("k", 2, "B", value = "TOP-SECRET")
         val withHistory = content(3, record("k", 3, "A"), history = listOf(secret))
         val deleted = content(4, record("k", 4, "A", deleted = true), history = listOf(secret))
         val result = mergeVaults(null, withHistory, deleted, "A")
         assertTrue(byId(result.merged)["k"]!!.deleted)
-        assertTrue(result.merged.history.none { it.id == "k" }, "old versions of a deleted record must leave the history")
+        // Only the LAST live version (revision 3) stays, restorable; the older secret leaves the history.
+        assertEquals(listOf(3L), result.merged.history.filter { it.id == "k" }.map { it.revision })
         assertTrue(result.changedLocally)
-        // A loser overridden by a tombstone with the same revision is scrubbed too.
+        // A live loser overridden by a tombstone with the same revision is the last live version: it is kept.
         val edit = content(2, record("e", 2, "A", value = "SECRET2"))
         val tomb = content(2, record("e", 2, "B", deleted = true))
         val tie = mergeVaults(null, edit, tomb, "A")
         assertTrue(byId(tie.merged)["e"]!!.deleted)
-        assertTrue(tie.merged.history.none { it.id == "e" })
-        // Re-merging with a side that still has the entry removes it again (convergent, idempotent).
+        assertEquals(listOf(2L), tie.merged.history.filter { it.id == "e" }.map { it.revision })
+        // Re-merging with a side that still has the older entry removes it again (convergent, idempotent).
         val again = mergeVaults(result.merged, result.merged, withHistory, "A")
-        assertTrue(again.merged.history.none { it.id == "k" })
+        assertEquals(listOf(3L), again.merged.history.filter { it.id == "k" }.map { it.revision })
+        assertEquals(result.merged.history, mergeVaults(null, result.merged, result.merged, "A").merged.history)
+    }
+
+    @Test
+    fun theLastLiveVersionIsScrubbedOnceTheRestoreWindowHasPassed() {
+        val live = record("k", 3, "A", value = "SECRET")
+        val tomb = record("k", 4, "A", deleted = true)
+        val inside = content(4 + RESTORE_WINDOW_REVISIONS, tomb, history = listOf(live))
+        val outside = content(4 + RESTORE_WINDOW_REVISIONS + 1, tomb, history = listOf(live))
+        assertEquals(1, mergeVaults(null, inside, inside, "A").merged.history.size, "still inside the window")
+        assertEquals(0, mergeVaults(null, outside, outside, "A").merged.history.size, "outside the window it is scrubbed")
+    }
+
+    @Test
+    fun restoreBringsADeletedRecordBackAsANewVersionAboveEverythingSeen() {
+        val live = record("k", 3, "A", value = "SECRET")
+        val tomb = record("k", 4, "A", deleted = true)
+        val merged = mergeVaults(null, content(3, live), content(4, tomb), "A").merged
+        val editor = VaultEditor(merged, "B", revisionFloor = 10)
+        val version = merged.history.single { it.id == "k" }
+        val restored = editor.restore(version)!!
+        assertFalse(restored.deleted)
+        assertEquals(payload("SECRET"), restored.payload)
+        assertEquals(11L, restored.revision)
+        assertEquals("B", restored.deviceId)
+        editor.content.validate()
+        // Only deleted records can be restored, and only from a live version of the same record.
+        assertEquals(null, editor.restore(version))
+        assertEquals(null, VaultEditor(merged, "B").restore(record("other", 2, "A")))
+        assertEquals(null, VaultEditor(merged, "B").restore(tomb))
+        // The restored version beats the tombstone on every device.
+        val back = mergeVaults(null, editor.content, content(4, tomb), "A").merged
+        assertFalse(byId(back)["k"]!!.deleted)
     }
 
     @Test
@@ -528,7 +563,8 @@ class MergeTest {
         val x3 = record("x", 3, "A")
         val tomb5 = record("x", 5, "A", deleted = true)
         val live6 = record("x", 6, "B")
-        val a = content(5, tomb5, history = listOf(x3))
+        // `a` is far past the restore window of the tombstone, so merging it scrubs the old version.
+        val a = content(5 + RESTORE_WINDOW_REVISIONS + 5, tomb5, history = listOf(x3))
         val b = content(5, tomb5)
         val c = content(6, live6)
         fun m(p: VaultContent, q: VaultContent) = mergeVaults(null, p, q, "A").merged

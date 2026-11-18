@@ -38,7 +38,16 @@ object VaultCodec {
     const val MAX_PASSWORD_SLOTS: Int = 1
 
     private const val MAX_ID_CHARS = 128
-    private const val MAX_KEY_EPOCH = 0xFFFF_FFFFL
+
+    /** Largest key epoch a header can carry (a u32). */
+    const val MAX_KEY_EPOCH: Long = 0xFFFF_FFFFL
+
+    /**
+     * A replacement or rotation that would leave fewer than this many epochs below [MAX_KEY_EPOCH] is refused by the
+     * sync layer (migrate to a new vault instead): a hostile or buggy writer must not be able to burn the epoch space.
+     */
+    const val KEY_EPOCH_HEADROOM: Long = 1L shl 16
+
     private const val FIXED_PREFIX_BYTES = 10 // magic(4) + version(2) + headerLength(4)
     private const val WRITE_SALT_BYTES = 32
     private const val UNLOCK_SECRET_VERSION = 1
@@ -233,6 +242,16 @@ object VaultCodec {
     }
 
     /**
+     * The key fingerprint ([OpenVault.fingerprint]) that the vault file [bytes] **claims**, computed from its header
+     * without any cryptography (so it is not authenticated: it is what a device that opens the file would show). Used
+     * to show the user which key a competing file carries before they confirm anything.
+     */
+    fun claimedFingerprint(bytes: ByteArray): String {
+        val h = parse(bytes, KdfParams.MAX_MEMORY_KIB).header
+        return keyFingerprintOf(h.vaultId, h.keyEpoch, b64.decode(h.keyCommit))
+    }
+
+    /**
      * Reads the structural facts of a file's header without any cryptography. **Nothing returned is
      * authenticated**; use it to decide which key to try, then rely on the values of the opened vault.
      */
@@ -290,8 +309,10 @@ object VaultCodec {
      * Replaces the password (and, with [kdf], the key-derivation parameters) **and replaces the data key**: the old
      * password, together with any old copy of the file, can no longer open anything written afterwards. This is the
      * only way to change the password slot: the header never changes within a key epoch. The key epoch increases by
-     * one (or to [atLeastEpoch] when that is higher, for a replacement that must outrank a foreign epoch) and the new
-     * epoch is linked to the old one. [kdf] defaults to the parameters of the replaced slot.
+     * one (or to [atLeastEpoch] when that is higher; the sync layer only ever passes a value derived from **authenticated
+     * local state**, never a number read from an unauthenticated remote header) and the new epoch is linked to the old
+     * one. Throws [VaultException.InvalidContent] when the epoch counter is exhausted (the sync layer refuses well
+     * before that, see [KEY_EPOCH_HEADROOM], and `VaultSession.migrateToNewVault` is the way out). [kdf] defaults to the parameters of the replaced slot.
      *
      * The returned vault owns a new key; the caller closes [vault] (it still holds the old key).
      */

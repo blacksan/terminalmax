@@ -4,15 +4,18 @@
 package org.terminalmax.core.sync
 
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.channels.FileLock
+import java.nio.ByteBuffer
 import java.nio.channels.OverlappingFileLockException
 import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
+import java.nio.file.attribute.FileAttribute
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.io.encoding.Base64
@@ -63,6 +66,13 @@ enum class SalvageSource { Current, CurrentIgnoringChecksum, Previous, PreviousI
  * must not contain network I/O. Exclusion from other processes (and from a second session in this process) is
  * [lockDirectory], an OS-level lock held for the lifetime of a `VaultSession`. Without it a state store has no
  * protection against another process.
+ *
+ * **Permissions.** On POSIX file systems the directory is created `0700` and every file the store creates (state, temp,
+ * previous copy, lock) `0600`, set at creation through `java.nio.file` attributes (existing files are tightened
+ * best-effort when the directory is locked; an existing directory is never chmod-ed). On Windows nothing is set: the
+ * files inherit the ACL of the profile folder they are in, which already restricts them to the user (and
+ * administrators). What is stored in the clear is documented in the sync README (vault id, revisions, key epoch, file
+ * digests, device id; the probe results per server).
  *
  * @param directory a directory supplied by the app (for example `context.filesDir` + "/sync"); created if missing
  */
@@ -129,32 +139,102 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
      * @throws LocalStateException when the lock file cannot be opened
      */
     fun lockDirectory(): DirectoryLock {
-        val channel = try {
-            if (!dir.isDirectory && !dir.mkdirs() && !dir.isDirectory) {
-                throw LocalStateException("The sync state directory cannot be created")
+        // Process-wide registry first: a second open in this process is rejected BEFORE any channel on the lock file
+        // is opened, because closing any descriptor of a file drops all of the process's POSIX locks on it.
+        val key = lockKey()
+        val token = Any()
+        if (openDirectories.putIfAbsent(key, token) != null) throw VaultSessionException.DirectoryInUse(dir)
+        var channel: FileChannel? = null
+        try {
+            ensureDirectory()
+            tightenExisting()
+            channel = FileChannel.open(
+                lockFile.toPath(), setOf(StandardOpenOption.CREATE, StandardOpenOption.WRITE), *fileAttributes(),
+            )
+            val lock: FileLock? = try {
+                channel.tryLock()
+            } catch (e: OverlappingFileLockException) {
+                null // cannot happen while the registry holds the entry, but never close a channel then
             }
-            FileChannel.open(lockFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+            if (lock == null) {
+                // Another process holds it; this process holds no lock on the file (registry), so closing is safe.
+                runCatching { channel.close() }
+                openDirectories.remove(key, token)
+                throw VaultSessionException.DirectoryInUse(dir)
+            }
+            return DirectoryLock(channel, lock, key, token)
+        } catch (e: VaultSessionException) {
+            throw e
+        } catch (e: LocalStateException) {
+            openDirectories.remove(key, token)
+            throw e
         } catch (e: IOException) {
-            throw LocalStateException("The sync state lock cannot be opened", e)
-        }
-        val lock: FileLock? = try {
-            channel.tryLock()
-        } catch (e: OverlappingFileLockException) {
-            null // this JVM already holds it
-        } catch (e: IOException) {
-            runCatching { channel.close() }
+            runCatching { channel?.close() }
+            openDirectories.remove(key, token)
             throw LocalStateException("The sync state lock cannot be taken", e)
         }
-        if (lock == null) {
-            runCatching { channel.close() }
-            throw VaultSessionException.DirectoryInUse(dir)
-        }
-        return DirectoryLock(channel, lock)
     }
 
-    /** The OS-level directory lock; closing it releases the lock. */
-    class DirectoryLock internal constructor(private val channel: FileChannel, private val lock: FileLock) : AutoCloseable {
+    private fun lockKey(): String = try {
+        lockFile.canonicalPath
+    } catch (e: IOException) {
+        lockFile.absolutePath
+    }
+
+    private val posix: Boolean = try {
+        dir.toPath().fileSystem.supportedFileAttributeViews().contains("posix")
+    } catch (e: Exception) {
+        false
+    }
+
+    private fun fileAttributes(): Array<FileAttribute<*>> =
+        if (posix) arrayOf(PosixFilePermissions.asFileAttribute(OWNER_FILE)) else emptyArray()
+
+    /** Creates the directory (`0700` on POSIX, set at creation); an existing directory is left as it is. */
+    private fun ensureDirectory() {
+        if (dir.isDirectory) return
+        try {
+            if (posix) {
+                Files.createDirectories(dir.toPath(), PosixFilePermissions.asFileAttribute(OWNER_DIR))
+            } else {
+                dir.mkdirs()
+            }
+        } catch (e: FileAlreadyExistsException) {
+            // A concurrent creator won.
+        } catch (e: IOException) {
+            throw LocalStateException("The sync state directory cannot be created", e)
+        }
+        if (!dir.isDirectory) throw LocalStateException("The sync state directory cannot be created")
+    }
+
+    /** Best effort: files of an older version of the store (created with the default umask) become owner-only. */
+    private fun tightenExisting() {
+        if (!posix) return
+        for (f in listOf(stateFile, prevFile, lockFile, tempFile)) {
+            if (f.exists()) {
+                try {
+                    Files.setPosixFilePermissions(f.toPath(), OWNER_FILE)
+                } catch (e: Exception) {
+                    // Not ours to change; the session works either way.
+                }
+            }
+        }
+    }
+
+    /** The OS-level directory lock; closing it releases the lock (idempotent). */
+    class DirectoryLock internal constructor(
+        private val channel: FileChannel,
+        private val lock: FileLock,
+        private val key: String,
+        private val token: Any,
+    ) : AutoCloseable {
+        @Volatile
+        private var closed = false
+
+        @Synchronized
         override fun close() {
+            if (closed) return
+            closed = true
             try {
                 lock.release()
             } catch (e: IOException) {
@@ -165,6 +245,7 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
             } catch (e: IOException) {
                 // Nothing more to do.
             }
+            openDirectories.remove(key, token)
         }
     }
 
@@ -201,7 +282,14 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
                 }
                 val kept = LocalSyncState(
                     vaults = current.vaults
-                        .mapValues { (_, v) -> VaultSyncState(localFile = v.localFile, pendingLocalFile = v.pendingLocalFile) }
+                        .mapValues { (_, v) -> VaultSyncState(
+                                localFile = v.localFile,
+                                pendingLocalFile = v.pendingLocalFile,
+                                pendingHoldsNewerEdits = v.pendingHoldsNewerEdits,
+                                discardedPendingEpoch = v.discardedPendingEpoch,
+                                chainWarning = v.chainWarning,
+                            )
+                        }
                         .filterValues { it.localFile != null || it.pendingLocalFile != null },
                     servers = emptyMap(),
                     deviceId = current.deviceId,
@@ -301,7 +389,12 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
             val localFile = o["local"]?.jsonPrimitive?.content?.let { Base64.Default.decode(it) }
             val pending = o["pending"]?.jsonPrimitive?.content?.let { Base64.Default.decode(it) }
             val chain = o["chain"]?.jsonObject?.let {
-                ChainWarning(it.getValue("from").jsonPrimitive.long, it.getValue("to").jsonPrimitive.long)
+                ChainWarning(
+                    it.getValue("from").jsonPrimitive.long,
+                    it.getValue("to").jsonPrimitive.long,
+                    passwordUnchanged = it["pwu"]?.jsonPrimitive?.boolean ?: false,
+                    unverified = it["unv"]?.jsonPrimitive?.boolean ?: true,
+                )
             }
             val digests = LinkedHashMap<Long, String>()
             for ((revision, digest) in o.getValue("digests").jsonObject) {
@@ -315,6 +408,8 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
                 fileDigests = digests,
                 pendingLocalFile = pending,
                 chainWarning = chain,
+                pendingHoldsNewerEdits = o["pendingAhead"]?.jsonPrimitive?.boolean ?: false,
+                discardedPendingEpoch = o["discarded"]?.jsonPrimitive?.long,
             )
             if (state.highestRevision < 0 || state.highestKeyEpoch < 0) {
                 throw LocalStateException("The sync state file holds invalid numbers")
@@ -357,8 +452,17 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
             o["keyEpoch"] = JsonPrimitive(v.highestKeyEpoch)
             v.pendingLocalFile?.let { o["pending"] = JsonPrimitive(Base64.Default.encode(it)) }
             v.chainWarning?.let {
-                o["chain"] = JsonObject(mapOf("from" to JsonPrimitive(it.fromEpoch), "to" to JsonPrimitive(it.toEpoch)))
+                o["chain"] = JsonObject(
+                    mapOf(
+                        "from" to JsonPrimitive(it.fromEpoch),
+                        "to" to JsonPrimitive(it.toEpoch),
+                        "pwu" to JsonPrimitive(it.passwordUnchanged),
+                        "unv" to JsonPrimitive(it.unverified),
+                    ),
+                )
             }
+            if (v.pendingHoldsNewerEdits) o["pendingAhead"] = JsonPrimitive(true)
+            v.discardedPendingEpoch?.let { o["discarded"] = JsonPrimitive(it) }
             val digests = LinkedHashMap<String, JsonElement>()
             for ((revision, digest) in v.fileDigests) digests[revision.toString()] = JsonPrimitive(digest)
             o["digests"] = JsonObject(digests)
@@ -393,18 +497,18 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
 
     private fun writeToDisk(state: LocalSyncState) {
         try {
-            if (!dir.isDirectory && !dir.mkdirs() && !dir.isDirectory) {
-                throw LocalStateException("The sync state directory cannot be created")
-            }
+            ensureDirectory()
             val payload = encode(state)
             val digest = MessageDigest.getInstance("SHA-256").digest(payload)
-            FileOutputStream(tempFile).use { out ->
-                out.write(MAGIC)
-                out.write(VERSION.toInt())
-                out.write(digest)
-                out.write(payload)
-                out.flush()
-                out.fd.sync()
+            // Created owner-only (POSIX) at creation, never widened afterwards: the temp file is the future state file.
+            Files.deleteIfExists(tempFile.toPath())
+            FileChannel.open(
+                tempFile.toPath(), setOf(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE), *fileAttributes(),
+            ).use { channel ->
+                val buffer = ByteBuffer.allocate(MAGIC.size + 1 + digest.size + payload.size)
+                buffer.put(MAGIC).put(VERSION).put(digest).put(payload).flip()
+                while (buffer.hasRemaining()) channel.write(buffer)
+                channel.force(true)
             }
             beforeRenameHook?.invoke()
             // Rolling previous copy: the current file becomes .prev first (only .prev exists between the two renames).
@@ -468,5 +572,10 @@ class FileLocalStateStore(directory: File, fileName: String = DEFAULT_FILE_NAME)
         private const val MOVE_ATTEMPTS = 5
         private const val MOVE_RETRY_MILLIS = 250L
         private val mutexes = ConcurrentHashMap<String, Mutex>()
+
+        /** Canonical lock-file paths of the directories this process holds (see [lockDirectory]). */
+        private val openDirectories = ConcurrentHashMap<String, Any>()
+        private val OWNER_DIR = PosixFilePermissions.fromString("rwx------")
+        private val OWNER_FILE = PosixFilePermissions.fromString("rw-------")
     }
 }

@@ -101,7 +101,29 @@ class VaultEditor(
             extra = VaultJson.emptyObject, // unknown record-level fields of newer versions may hold secrets too
         )
         store(tombstone)
+        // The last live version stays in the history for the restore window (see mergeVaults), exactly as a merge
+        // would leave it: the first sync of a plain delete is then not reported as a merge.
+        content = content.copy(history = normalizeHistory(content.history.filterNot { it.id == id } + existing))
         return tombstone
+    }
+
+    /**
+     * Brings a deleted record back from [version], one of its older live versions (kept in the vault history for a
+     * while after a deletion, see `mergeVaults`). The result is a **new** version of this device above everything seen
+     * (so it outranks the tombstone and replicates like any edit). Returns null when the record does not exist, is
+     * not deleted, or [version] is not a live version of it.
+     */
+    fun restore(version: VaultRecord): VaultRecord? {
+        val existing = content.records.firstOrNull { it.id == version.id } ?: return null
+        if (!existing.deleted || version.deleted || existing.wireTypeName != version.wireTypeName) return null
+        val restored = version.copy(
+            revision = nextRevision(maxOf(existing.revision, content.revision, revisionFloor)),
+            deviceId = deviceId,
+            updatedAtEpochMs = clock(),
+            deleted = false,
+        )
+        store(restored)
+        return restored
     }
 
     private fun store(record: VaultRecord) {

@@ -51,7 +51,7 @@ interface VaultCodecHooks {
      * epoch**: a file of the same epoch and key whose header differs from the held one is refused with
      * `VaultException.HeaderMismatchSameEpoch` (nothing is adopted, merged or re-sealed). Other failures:
      * `KeyEpochMismatch` (another key epoch: newer means the vault was re-keyed and the password is needed, older is
-     * a replay) and `KeyMismatchSameEpoch` (the same epoch under another key: a password may open it, see [reopen]).
+     * a replay) and `KeyMismatchSameEpoch` (the same epoch under another key: a password alone never adopts it: the user confirms the fingerprint, see [reopen]).
      */
     fun decrypt(bytes: ByteArray): DecryptedVault
 
@@ -80,6 +80,15 @@ interface VaultCodecHooks {
 
     /** Makes [staged] the header and key this device holds; the previous key is zeroed. */
     fun commitStaged(staged: StagedHeaderChange)
+
+    /** Whether two vault files carry the same header apart from the write salt (no cryptography). */
+    fun sameHeader(a: ByteArray, b: ByteArray): Boolean
+
+    /** The key epoch a file's header **claims** (not authenticated; no cryptography). */
+    fun claimedKeyEpoch(bytes: ByteArray): Long
+
+    /** The key fingerprint a file's header **claims** (`OpenVault.fingerprint` of the key it would open to). */
+    fun claimedFingerprint(bytes: ByteArray): String
 
     /** SHA-256 of [bytes] as lower-case hex (used to detect two different files with the same revision). */
     fun fingerprint(bytes: ByteArray): String
