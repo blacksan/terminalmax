@@ -1,11 +1,14 @@
 # Third-party actions are pinned to full commit SHAs (the version is in the trailing comment);
 # Dependabot (.github/dependabot.yml) proposes bumps. The artifacts uploaded here are UNSIGNED
-# debug/CI builds of every branch push: treat them as untrusted and never release from this workflow.
+# debug/CI builds. Branch pushes and pull requests run it directly; release.yml calls it for
+# version tags and publishes the same artifacts as a GitHub pre-release.
 name: CI
 
 on:
   push:
+    branches: ['**']
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
