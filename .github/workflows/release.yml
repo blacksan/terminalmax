@@ -1,0 +1,64 @@
+# Pushing a tag like v0.1.0 builds and tests everything through ci.yml, then publishes the Android
+# APK, the macOS DMG and the Windows MSI from that same run as a GitHub pre-release.
+# The builds are unsigned (the APK carries the CI runner's debug signature).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download the build artifacts of this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir in \
+            -n terminalmax-debug-apk -n terminalmax-macos-arm64-dmg -n terminalmax-windows-x64-msi
+          find in -type f
+      - name: Name the files and write checksums
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          mkdir dist
+          one() { local f; f=$(find in -type f -name "$1" | head -n 1); [ -n "$f" ] || { echo "::error::no $1"; exit 1; }; cp "$f" "dist/$2"; }
+          one '*.apk' "TerminalMax-$v-android.apk"
+          one '*.dmg' "TerminalMax-$v-macos-arm64.dmg"
+          one '*.msi' "TerminalMax-$v-windows-x64.msi"
+          (cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+      - name: Publish the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<'EOF'
+          **Pre-alpha test build. Do not store real credentials yet.** See the [user guide](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/USER_GUIDE.md).
+
+          | Platform | File |
+          |---|---|
+          | Android 8.0+ (arm64 and x86_64) | `TerminalMax-*-android.apk` |
+          | macOS on Apple Silicon | `TerminalMax-*-macos-arm64.dmg` |
+          | Windows 10/11 x64 | `TerminalMax-*-windows-x64.msi` |
+
+          These builds are not signed with a publisher certificate:
+          - **Android:** allow installing from this source when prompted. Each build carries a different debug signature, so uninstall the previous build before installing a new one (this deletes its local vault; sync it to WebDAV first).
+          - **macOS:** after dragging the app to Applications, run `xattr -dr com.apple.quarantine /Applications/TerminalMax.app` once, or right-click the app and choose Open.
+          - **Windows:** if SmartScreen appears, choose "More info" and then "Run anyway".
+
+          Check downloads against `SHA256SUMS.txt`.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --prerelease --title "TerminalMax ${GITHUB_REF_NAME} (pre-alpha)" --notes-file notes.md

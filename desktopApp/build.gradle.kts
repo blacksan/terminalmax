@@ -20,9 +20,10 @@ java {
 
 dependencies {
     implementation(projects.core.designsystem)
-    implementation(projects.feature.proof)
-    // Not referenced by the proof UI yet; listed so desktop packaging sees the SSH module.
+    implementation(projects.feature.app)
     implementation(projects.core.ssh)
+    implementation(projects.core.sync)
+    implementation(projects.core.vault)
     // JNA binding of libwgbridge; the library itself is bundled from resources/<os>-<arch>/.
     implementation(projects.core.wireguard)
     implementation(compose.desktop.currentOs)

@@ -43,8 +43,8 @@ android {
 
     defaultConfig {
         applicationId = "org.terminalmax.app"
-        versionCode = 1
-        versionName = "0.1.0-proof"
+        versionCode = 2
+        versionName = "0.2.0-pre-alpha"
 
         // libwgbridge.so is built for these two ABIs only (no 32-bit library exists).
         ndk {
@@ -55,9 +55,11 @@ android {
 
 dependencies {
     implementation(projects.core.designsystem)
-    implementation(projects.feature.proof)
-    // Not referenced by the proof UI yet; listed so R8 (consumer rules) and packaging see the SSH module.
+    implementation(projects.feature.app)
     implementation(projects.core.ssh)
+    implementation(projects.core.sync)
+    implementation(projects.core.vault)
+    implementation(libs.kotlinx.coroutines.core)
     // libwgbridge.so is copied into src/main/jniLibs/<abi>/ by CI (see .github/workflows/ci.yml).
     implementation(projects.core.wireguard)
     implementation(libs.androidx.activity.compose)

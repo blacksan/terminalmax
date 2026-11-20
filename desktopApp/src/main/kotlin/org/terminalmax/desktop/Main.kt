@@ -3,8 +3,11 @@ package org.terminalmax.desktop
 
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
-import org.terminalmax.core.designsystem.theme.AppTheme
-import org.terminalmax.feature.proof.ProofScreen
+import androidx.compose.ui.unit.DpSize
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.rememberWindowState
+import org.terminalmax.feature.app.AppContainer
+import org.terminalmax.feature.app.TerminalMaxApp
 import kotlin.system.exitProcess
 
 private const val SELF_TEST_FLAG = "--self-test"
@@ -16,11 +19,18 @@ fun main(args: Array<String>) {
     if (selfTest != null) {
         exitProcess(runSelfTest(selfTest.substringAfter('=', "").takeIf { it.isNotEmpty() }))
     }
+    val container = AppContainer(DesktopPlatform())
     application {
-        Window(onCloseRequest = ::exitApplication, title = "TerminalMax") {
-            AppTheme {
-                ProofScreen()
-            }
+        Window(
+            onCloseRequest = {
+                container.sessions.closeAll()
+                container.vault.lock()
+                exitApplication()
+            },
+            title = "TerminalMax",
+            state = rememberWindowState(size = DpSize(1100.dp, 750.dp)),
+        ) {
+            TerminalMaxApp(container)
         }
     }
 }
